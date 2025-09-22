@@ -37,7 +37,7 @@ module MailerInfo::Encryption
 
     def encryption_keys
       {
-        1 => GlobalConfig.get("MAILER_HEADERS_ENCRYPTION_KEY_V1"),
+        1 => GlobalConfig.get("MAILER_HEADERS_ENCRYPTION_KEY_V1", "development_mailer_encryption_key_v1").presence || "development_mailer_encryption_key_v1",
         # Add new keys as needed, old keys must be kept for old emails
         # 2 => GlobalConfig.get("MAILER_HEADERS_ENCRYPTION_KEY_V2"),
       }

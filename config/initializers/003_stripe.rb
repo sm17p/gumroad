@@ -1,6 +1,13 @@
 # frozen_string_literal: true
 
-Stripe.api_version = Rails.env.test? ? "2023-10-16" : "2023-10-16; risk_in_requirements_beta=v1; retrieve_tax_forms_beta=v1;"
+# Stripe.api_version = !Rails.env.production? ? "2023-10-16" : "2023-10-16; risk_in_requirements_beta=v1"
+Stripe.api_version = if Rails.env.development?
+  "2025-11-17.clover"
+elsif Rails.env.test?
+  "2023-10-16"
+else
+  "2023-10-16; risk_in_requirements_beta=v1; retrieve_tax_forms_beta=v1;"
+end
 # Ref: https://github.com/gumroad/web/issues/17770, https://stripe.com/docs/rate-limits#object-lock-timeouts
 Stripe.max_network_retries = 3
 if Rails.env.production?

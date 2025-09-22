@@ -1,0 +1,8 @@
+---
+description: When using chrome mcp to debug use these login credentials
+alwaysApply: false
+baseUrl: https://gumroad.dev
+email: seller@gumroad.com
+password: password
+otp: should be pre-filled just click login again
+---

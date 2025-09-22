@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 class Rack::Attack
+  self.enabled = !Rails.env.development? && !Rails.env.test?
   redis_url    = ENV.fetch("RACK_ATTACK_REDIS_HOST")
   redis_client = Redis.new(url: "redis://#{redis_url}")
   Rack::Attack.cache.store = Rack::Attack::StoreProxy::RedisStoreProxy.new(redis_client)

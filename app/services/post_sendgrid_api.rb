@@ -126,7 +126,7 @@ class PostSendgridApi
       assigns = @cache[@post][:assigns]
 
       personalization = SendGrid::Personalization.new
-      personalization.add_to(SendGrid::Email.new(email: recipient[:email]))
+      personalization.add_to(SendGrid::Email.new(email: EmailOverride.override_if_needed(recipient[:email])))
       personalization.add_substitution SendGrid::Substitution.new(key: "{{subject}}", value: @post.subject)
 
       if assigns[:has_post_url]

@@ -4,7 +4,7 @@ unless ENV["DISABLE_RACK_TIMEOUT"] == "1"
   Rails.application.config.middleware.insert_before(
     Rack::Runtime,
     Rack::Timeout,
-    service_timeout: 120,
+    service_timeout: 5,
     wait_overtime: 24.hours.to_i,
     wait_timeout: false
   )

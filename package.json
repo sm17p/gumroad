@@ -73,6 +73,7 @@
   "devDependencies": {
     "@eslint/compat": "^1.1.1",
     "@eslint/js": "^9.6.0",
+    "@playwright/test": "^1.56.0",
     "@tailwindcss/postcss": "^4.1.14",
     "@tailwindcss/typography": "^0.5.19",
     "@types/braintree-web": "^3.75.22",

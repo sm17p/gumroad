@@ -8,6 +8,7 @@
 *.swo
 *.swp
 .bundle
+mise.toml
 .byebug_history
 .DS_Store
 .env
@@ -62,3 +63,7 @@ nomad/
 docs/ssh.md
 test-branch-creation.log
 .vercel
+
+# Playwright
+/test-results/
+/blob-report/

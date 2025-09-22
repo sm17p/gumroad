@@ -60,22 +60,80 @@ end
 
 def create_recommendable_product_if_not_exists(user, taxonomy_slug)
   product_name = "Beautiful #{taxonomy_slug} widget"
-  product = user.links.find_by(name: product_name)
 
-  return if product.present?
+  # Create main product
+  unless user.links.exists?(name: product_name)
+    product = user.links.create!(
+      name: product_name,
+      description: "Description for demo product",
+      filetype: "link",
+      price_cents: 500,
+      taxonomy: Taxonomy.find_by(slug: taxonomy_slug),
+      display_product_reviews: true
+    )
+    product.tag!(taxonomy_slug[0..19])
+    buyer = User.find_by(email: "seller@gumroad.com")
+    create_purchase(user, buyer, product)
+  end
 
-  product = user.links.create!(
-    name: product_name,
-    description: "Description for demo product",
-    filetype: "link",
-    price_cents: 500,
-    taxonomy: Taxonomy.find_by(slug: taxonomy_slug),
-    display_product_reviews: true
-  )
-  product.tag!(taxonomy_slug[0..19])
+  # Create trial products
+  %w[1 2].each do |trial_number|
+    trial_name = "Trial #{trial_number} | #{product_name}"
+    create_or_update_trial_product(user, trial_name, trial_number, taxonomy_slug)
+  end
+end
 
-  buyer = User.find_by(email: "seller@gumroad.com")
-  create_purchase(user, buyer, product)
+private
+def create_or_update_trial_product(user, trial_name, trial_number, taxonomy_slug)
+  existing_product = user.links.find_by(name: trial_name)
+
+  if existing_product
+    Rails.logger.debug "Trial product #{trial_number} already exists: #{trial_name} for user #{user.id}"
+    ensure_correct_trial_purchases(existing_product, trial_name, trial_number, user)
+  else
+    Rails.logger.debug "Creating trial product #{trial_number}: #{trial_name} for user #{user.id}"
+
+    trial_product = user.links.create!(
+      name: trial_name,
+      description: "Trial #{trial_number} | Description for demo product",
+      filetype: "link",
+      price_cents: 0,
+      taxonomy: Taxonomy.find_by(slug: taxonomy_slug),
+      display_product_reviews: true
+    )
+
+    Rails.logger.debug "Trial product #{trial_number} created with ID: #{trial_product.id}"
+    trial_product.tag!(taxonomy_slug[0..19])
+    Rails.logger.debug "Trial product #{trial_number} tagged with: #{taxonomy_slug[0..19]}"
+
+    gumbo_buyer = User.find_by(email: "gumbo_writing@gumroad.com")
+    if gumbo_buyer
+      create_purchase(user, gumbo_buyer, trial_product)
+    else
+      Rails.logger.warn "User with email 'gumbo_writing@gumroad.com' not found. Skipping purchase creation for trial product #{trial_number}."
+    end
+  end
+end
+
+def ensure_correct_trial_purchases(trial_product, trial_name, trial_number, user)
+  # Remove any purchases from seller@gumroad.com
+  seller_purchases = trial_product.sales.joins(:purchaser).where(users: { email: "seller@gumroad.com" })
+  if seller_purchases.exists?
+    Rails.logger.debug "Deleting purchases from seller@gumroad.com for trial product #{trial_number}: #{trial_name}"
+    seller_purchases.destroy_all
+  end
+
+  # Ensure at least one purchase from gumbo_writing exists
+  gumbo_purchases = trial_product.sales.joins(:purchaser).where(users: { email: "gumbo_writing@gumroad.com" })
+  if gumbo_purchases.empty?
+    gumbo_buyer = User.find_by(email: "gumbo_writing@gumroad.com")
+    if gumbo_buyer
+      Rails.logger.debug "Creating purchase for trial product #{trial_number} with gumbo_writing buyer: #{trial_name}"
+      create_purchase(user, gumbo_buyer, trial_product)
+    else
+      Rails.logger.warn "User with email 'gumbo_writing@gumroad.com' not found. Cannot create purchase for trial product #{trial_number}."
+    end
+  end
 end
 
 create_recommendable_product_if_not_exists(find_or_create_recommendable_user("film"), "films")

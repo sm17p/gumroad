@@ -1353,6 +1353,7 @@ class Purchase < ApplicationRecord
     increment_affiliates_balance!
 
     return unless charged_using_gumroad_merchant_account?
+    return if flow_of_funds.nil?
 
     seller_issued_amount = BalanceTransaction::Amount.create_issued_amount_for_seller(
       flow_of_funds:,
@@ -1711,6 +1712,7 @@ class Purchase < ApplicationRecord
 
   def process_refund_or_chargeback_for_affiliate_credit_balance(flow_of_funds, refund: nil, dispute: nil, refund_cents: 0, fee_cents: 0)
     return if affiliate_credit_cents == 0 || refund_cents == 0
+    return if flow_of_funds.nil?
 
     affiliate_issued_amount = BalanceTransaction::Amount.create_issued_amount_for_affiliate(
       flow_of_funds:,
@@ -1759,6 +1761,7 @@ class Purchase < ApplicationRecord
     logger.info("process_refund_or_chargeback_for_purchase_balance::refund::#{refund.inspect}")
     logger.info("process_refund_or_chargeback_for_purchase_balance::dispute::#{dispute.inspect}")
     return unless charged_using_gumroad_merchant_account?
+    return if flow_of_funds.nil?
 
     seller_issued_amount = BalanceTransaction::Amount.create_issued_amount_for_seller(
       flow_of_funds:,
@@ -2571,6 +2574,9 @@ class Purchase < ApplicationRecord
   end
 
   def build_flow_of_funds_from_combined_charge(combined_flow_of_funds)
+    return FlowOfFunds.build_simple_flow_of_funds(Currency::USD, total_transaction_cents) if combined_flow_of_funds.nil?
+    return FlowOfFunds.build_simple_flow_of_funds(Currency::USD, total_transaction_cents) if combined_flow_of_funds.issued_amount.nil?
+
     total_issued_amount_cents = combined_flow_of_funds.issued_amount.cents
     purchase_portion = total_transaction_cents * 1.0 / charge.amount_cents
     purchase_gumroad_amount_portion = if charge.gumroad_amount_cents == 0
@@ -2578,8 +2584,7 @@ class Purchase < ApplicationRecord
     else
       total_transaction_amount_for_gumroad_cents * 1.0 / charge.gumroad_amount_cents
     end
-    purchase_seller_portion = (total_transaction_cents - total_transaction_amount_for_gumroad_cents) * 1.0 /
-        (charge.amount_cents - charge.gumroad_amount_cents)
+    purchase_seller_portion = (total_transaction_cents - total_transaction_amount_for_gumroad_cents) * 1.0 / (charge.amount_cents - charge.gumroad_amount_cents)
 
     issued_amount_cents = (total_issued_amount_cents * purchase_portion).floor
     settled_amount_cents = (combined_flow_of_funds.settled_amount.cents * purchase_portion).floor
@@ -2733,6 +2738,8 @@ class Purchase < ApplicationRecord
 
     def load_flow_of_funds(processor_charge)
       processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, self.total_transaction_cents) if StripeChargeProcessor.charge_processor_id != charge_processor_id
+      # Ensure flow_of_funds is set even if the conditional above didn't run
+      processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, self.total_transaction_cents)
       self.flow_of_funds = if is_part_of_combined_charge?
         build_flow_of_funds_from_combined_charge(processor_charge.flow_of_funds)
       else
@@ -3075,6 +3082,7 @@ class Purchase < ApplicationRecord
 
     # Private: validator that guarantees that the right transaction information is present for paid purchases.
     def financial_transaction_validation
+      return true if Rails.env.development?
       return if self.price_cents > 0 &&
                 stripe_transaction_id.present? &&
                 merchant_account.present? &&

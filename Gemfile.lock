@@ -204,6 +204,8 @@ GEM
     braintree (4.21.0)
       builder (>= 3.2.4)
       rexml (>= 3.1.9)
+    brakeman (7.1.1)
+      racc
     bson (5.1.1)
     buftok (0.3.0)
     bugsnag (6.27.1)
@@ -807,6 +809,8 @@ GEM
     ratelimit (1.1.0)
       redis (>= 3.0.0)
       redis-namespace (>= 1.0.0)
+    rbs (3.9.5)
+      logger
     rchardet (1.8.0)
     rdoc (6.15.0)
       erb
@@ -925,6 +929,12 @@ GEM
       lint_roller (~> 1.1)
       rubocop (~> 1.72, >= 1.72.1)
     ruby-limiter (2.3.0)
+    ruby-lsp (0.26.4)
+      language_server-protocol (~> 3.17.0)
+      prism (>= 1.2, < 2.0)
+      rbs (>= 3, < 5)
+    ruby-lsp-rspec (0.1.28)
+      ruby-lsp (~> 0.26.0)
     ruby-next-core (1.1.1)
     ruby-oembed (0.17.0)
     ruby-openai (7.1.0)
@@ -1144,6 +1154,7 @@ DEPENDENCIES
   benchmark (~> 0.4)
   bootsnap (~> 1.15)
   braintree (~> 4.9)
+  brakeman
   bugsnag (~> 6.25)
   builder (~> 3.2)
   bullet
@@ -1259,6 +1270,7 @@ DEPENDENCIES
   rubocop-rake (~> 0.7)
   rubocop-rspec (~> 3.6)
   ruby-limiter (~> 2.2)
+  ruby-lsp-rspec
   ruby-oembed (~> 0.16)
   ruby-openai (~> 7.0)
   rubyzip (~> 2.3)

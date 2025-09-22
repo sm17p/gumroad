@@ -4,13 +4,13 @@ require_relative "../../app/models/mailer_info"
 require_relative "../../app/models/mailer_info/delivery_method"
 
 if Rails.env.production?
-  FOLLOWER_CONFIRMATION_MAIL_DOMAIN = GlobalConfig.get("FOLLOWER_CONFIRMATION_MAIL_DOMAIN_PROD", "followers.gumroad.com")
-  CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN_PROD", "creators.gumroad.com")
-  CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CUSTOMERS_MAIL_DOMAIN_PROD", "customers.gumroad.com")
+  FOLLOWER_CONFIRMATION_MAIL_DOMAIN = GlobalConfig.get("FOLLOWER_CONFIRMATION_MAIL_DOMAIN_PROD", "followers.gumroad.com").presence || "followers.gumroad.com"
+  CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN_PROD", "creators.gumroad.com").presence || "creators.gumroad.com"
+  CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CUSTOMERS_MAIL_DOMAIN_PROD", "customers.gumroad.com").presence || "customers.gumroad.com"
 else
-  FOLLOWER_CONFIRMATION_MAIL_DOMAIN = GlobalConfig.get("FOLLOWER_CONFIRMATION_MAIL_DOMAIN_DEV", "staging.followers.gumroad.com")
-  CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN_DEV", "staging.creators.gumroad.com")
-  CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CUSTOMERS_MAIL_DOMAIN_DEV", "staging.customers.gumroad.com")
+  FOLLOWER_CONFIRMATION_MAIL_DOMAIN = GlobalConfig.get("FOLLOWER_CONFIRMATION_MAIL_DOMAIN_DEV", "staging.followers.gumroad.com").presence || "staging.followers.gumroad.com"
+  CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CREATOR_CONTACTING_CUSTOMERS_MAIL_DOMAIN_DEV", "staging.creators.gumroad.com").presence || "staging.creators.gumroad.com"
+  CUSTOMERS_MAIL_DOMAIN = GlobalConfig.get("CUSTOMERS_MAIL_DOMAIN_DEV", "staging.customers.gumroad.com").presence || "staging.customers.gumroad.com"
 end
 
 SENDGRID_SMTP_ADDRESS = GlobalConfig.get("SENDGRID_SMTP_ADDRESS", "smtp.sendgrid.net")
@@ -120,3 +120,27 @@ Rails.application.config.action_mailer.deliver_later_queue_name = :default
 
 SendGridApiResponseError = Class.new(StandardError)
 ResendApiResponseError = Class.new(StandardError)
+
+# Email override for development/testing
+# When USER_EMAIL_OVERRIDE is set, all recipient emails are routed to that address
+# with plus-tagging: original_email@example.com -> override+original_email@override_domain.com
+module EmailOverride
+  extend self
+
+  def override_if_needed(original_email)
+    return original_email unless Rails.env.development?
+
+    override_email = GlobalConfig.get("USER_EMAIL_OVERRIDE") || ENV["USER_EMAIL_OVERRIDE"]
+    return original_email if override_email.nil? || override_email.empty?
+
+    # Extract local part from original email (before @)
+    original_local_part, original_domain = original_email.split("@", 2)
+
+    # Split override email to get base local part and domain
+    override_local_part, override_domain = override_email.split("@", 2)
+    return original_email if override_local_part.blank? || override_domain.blank?
+
+    # Build new email: base_local_part+original_local_part@domain
+    "#{override_local_part}+#{original_local_part}+#{original_domain}@#{override_domain}"
+  end
+end

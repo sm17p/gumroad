@@ -12,10 +12,19 @@ class StripeCharge < BaseProcessorCharge
     self.refunded = stripe_charge[:refunded]
     self.disputed = stripe_charge[:dispute].present?
 
-    stripe_fee_detail = stripe_charge_balance_transaction[:fee_details].find { |fee_detail| fee_detail[:type] == "stripe_fee" }
-    if stripe_fee_detail.present?
-      self.fee_currency = stripe_fee_detail[:currency]
-      self.fee = stripe_fee_detail[:amount]
+    if stripe_charge_balance_transaction.present?
+      begin
+        fee_details = stripe_charge_balance_transaction[:fee_details] if stripe_charge_balance_transaction.respond_to?(:[])
+        if fee_details.present?
+          stripe_fee_detail = fee_details.find { |fee_detail| fee_detail[:type] == "stripe_fee" }
+          if stripe_fee_detail.present?
+            self.fee_currency = stripe_fee_detail[:currency]
+            self.fee = stripe_fee_detail[:amount]
+          end
+        end
+      rescue StandardError => e
+        Rails.logger.error("Error accessing fee_details from balance_transaction: #{e.class} - #{e.message}")
+      end
     end
 
     self.flow_of_funds = build_flow_of_funds(stripe_charge, stripe_charge_balance_transaction, stripe_application_fee_balance_transaction,
@@ -65,8 +74,13 @@ class StripeCharge < BaseProcessorCharge
       issued_amount = FlowOfFunds::Amount.new(currency: stripe_charge[:currency],
                                               cents: stripe_charge[:amount])
 
-      settled_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
-                                               cents: stripe_charge_balance_transaction[:amount])
+      if stripe_charge_balance_transaction.present?
+        settled_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
+                                                 cents: stripe_charge_balance_transaction[:amount])
+      else
+        Rails.logger.warn("balance_transaction is nil for charge #{stripe_charge[:id]}, using charge amount as settled_amount")
+        settled_amount = issued_amount
+      end
 
       if stripe_charge[:destination]
         if stripe_application_fee_balance_transaction.present?
@@ -103,11 +117,17 @@ class StripeCharge < BaseProcessorCharge
         # Note: The settled and merchant account gross amount will always be the same with Stripe Connect.
         # The transaction settles in the merchant account currency and the gross amount is the full settled amount.
 
-        merchant_account_gross_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
-                                                                cents: stripe_charge_balance_transaction[:amount])
+        if stripe_charge_balance_transaction.present?
+          merchant_account_gross_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
+                                                                  cents: stripe_charge_balance_transaction[:amount])
 
-        merchant_account_net_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
-                                                              cents: stripe_charge_balance_transaction[:net])
+          merchant_account_net_amount = FlowOfFunds::Amount.new(currency: stripe_charge_balance_transaction[:currency],
+                                                                cents: stripe_charge_balance_transaction[:net])
+        else
+          Rails.logger.warn("balance_transaction is nil for charge #{stripe_charge[:id]} in application_fee branch, using settled_amount")
+          merchant_account_gross_amount = settled_amount
+          merchant_account_net_amount = settled_amount
+        end
       else
         gumroad_amount = settled_amount
         merchant_account_gross_amount = nil

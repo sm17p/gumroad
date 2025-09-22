@@ -103,15 +103,18 @@ class StripeChargeProcessor
 
   def get_charge(charge_id, merchant_account: nil)
     with_stripe_error_handler do
+      expand_params = %w[balance_transaction application_fee.balance_transaction]
+      expand_params << "payment_intent" if Rails.env.development?
+
       if merchant_migrated? merchant_account
         begin
-          charge = Stripe::Charge.retrieve({ id: charge_id, expand: %w[balance_transaction application_fee.balance_transaction] }, { stripe_account: merchant_account.charge_processor_merchant_id })
+          charge = Stripe::Charge.retrieve({ id: charge_id, expand: expand_params }, { stripe_account: merchant_account.charge_processor_merchant_id })
         rescue StandardError => e
           Rails.logger.error("Falling back to retrieving charge from Gumroad due to #{e.inspect}")
-          charge = Stripe::Charge.retrieve(id: charge_id, expand: %w[balance_transaction application_fee.balance_transaction])
+          charge = Stripe::Charge.retrieve(id: charge_id, expand: expand_params)
         end
       else
-        charge = Stripe::Charge.retrieve(id: charge_id, expand: %w[balance_transaction application_fee.balance_transaction])
+        charge = Stripe::Charge.retrieve(id: charge_id, expand: expand_params)
       end
 
       get_charge_object(charge)
@@ -119,18 +122,81 @@ class StripeChargeProcessor
   end
 
   def get_charge_object(charge)
+    destination_transfer = nil
+    stripe_destination_payment = nil
+    transfer_group = nil
+
     if charge[:transfer_data]
+      payment_intent_hash = begin
+        charge[:payment_intent]
+      rescue NoMethodError, TypeError
+        nil
+      end
+
+      payment_intent_object = begin
+        charge.payment_intent
+      rescue NoMethodError
+        nil
+      end
+
+      payment_intent = payment_intent_hash || payment_intent_object
+
+      transfer_group = if payment_intent.nil?
+        nil
+      elsif payment_intent.is_a?(Stripe::PaymentIntent)
+        payment_intent.transfer_group
+      elsif payment_intent.is_a?(String)
+        begin
+          Stripe::PaymentIntent.retrieve(payment_intent).transfer_group
+        rescue StandardError => e
+          Rails.logger.error("Failed to retrieve PaymentIntent #{payment_intent}: #{e.inspect}")
+          nil
+        end
+      else
+        nil
+      end
+
+      if transfer_group
+        transfers = Stripe::Transfer.list(transfer_group: transfer_group, limit: 1)
+        destination_transfer = transfers.data.first if transfers.data.any?
+      else
+        transfers = Stripe::Transfer.list(charge: charge.id, limit: 1)
+        destination_transfer = transfers.data.first if transfers.data.any?
+      end
+
+      if destination_transfer
+        stripe_destination_payment = Stripe::Charge.retrieve({ id: destination_transfer.destination_payment, expand: %w[balance_transaction] },
+                                                             { stripe_account: destination_transfer.destination })
+      end
+    elsif charge[:transfer]
       destination_transfer = Stripe::Transfer.retrieve(id: charge.transfer)
       stripe_destination_payment = Stripe::Charge.retrieve({ id: destination_transfer.destination_payment, expand: %w[balance_transaction] },
                                                            { stripe_account: destination_transfer.destination })
     end
-    balance_transaction = charge.balance_transaction
-    if balance_transaction.is_a?(String)
-      merchant_account = Purchase.find(charge.transfer_group).merchant_account rescue nil
+
+    balance_transaction = charge.balance_transaction || charge[:balance_transaction]
+
+    if balance_transaction.nil?
+      balance_transaction_id = charge[:balance_transaction] || charge.balance_transaction
+      if balance_transaction_id.is_a?(String)
+        merchant_account = nil
+        if transfer_group
+          merchant_account = Purchase.find_by(transfer_group: transfer_group)&.merchant_account rescue nil
+        end
+        balance_transaction = merchant_account&.is_a_stripe_connect_account? ?
+                                Stripe::BalanceTransaction.retrieve({ id: balance_transaction_id }, { stripe_account: merchant_account.charge_processor_merchant_id }) :
+                                Stripe::BalanceTransaction.retrieve({ id: balance_transaction_id })
+      end
+    elsif balance_transaction.is_a?(String)
+      merchant_account = nil
+      if transfer_group
+        merchant_account = Purchase.find_by(transfer_group: transfer_group)&.merchant_account rescue nil
+      end
       balance_transaction = merchant_account&.is_a_stripe_connect_account? ?
                               Stripe::BalanceTransaction.retrieve({ id: balance_transaction }, { stripe_account: merchant_account.charge_processor_merchant_id }) :
                               Stripe::BalanceTransaction.retrieve({ id: balance_transaction })
     end
+
     StripeCharge.new(charge, balance_transaction, charge.application_fee.try(:balance_transaction),
                      stripe_destination_payment.try(:balance_transaction), destination_transfer)
   end

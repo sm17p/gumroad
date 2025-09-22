@@ -5,6 +5,7 @@ AWS_ACCESS_KEY = GlobalConfig.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = GlobalConfig.get("AWS_SECRET_ACCESS_KEY")
 AWS_S3_ENDPOINT = GlobalConfig.get("AWS_S3_ENDPOINT", "https://s3.amazonaws.com")
 AWS_DEFAULT_REGION = GlobalConfig.get("AWS_DEFAULT_REGION", "us-east-1")
+AWS_BUCKET_PREFIX = GlobalConfig.get("AWS_BUCKET_PREFIX", "")
 
 USING_MINIO = AWS_S3_ENDPOINT.present? && !AWS_S3_ENDPOINT.include?("amazonaws.com")
 
@@ -34,6 +35,14 @@ KINDLE_EMAIL_REGEX = /\A(?=.{3,255}$)(                                         #
                      ([^@\s()\[\],.<>;:\\"]+(\.[^@\s()\[\],.<>;:\\"]+)*))      # cannot start with or have consecutive dots
                      @kindle\.com\z/xi
 
+
+# S3_BUCKET = AWS_BUCKET_PREFIX + {
+#   development: "gumroad_dev",
+#   staging: "gumroad_dev",
+#   test: "gumroad-specs",
+#   production: "gumroad"
+# }[Rails.env.to_sym]
+
 S3_BUCKET = {
   development: "gumroad-dev",
   staging: "gumroad_dev",
@@ -44,7 +53,7 @@ S3_BUCKET = {
 S3_BASE_URL = GlobalConfig.get("S3_BASE_URL_TEMPLATE", "#{AWS_S3_ENDPOINT}/#{S3_BUCKET}/")
 
 
-PUBLIC_STORAGE_S3_BUCKET = {
+PUBLIC_STORAGE_S3_BUCKET = AWS_BUCKET_PREFIX + {
   development: "gumroad-dev-public-storage",
   staging: "gumroad-dev-public-storage",
   test: "gumroad-specs",

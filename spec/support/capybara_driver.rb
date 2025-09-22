@@ -5,6 +5,7 @@ webdriver_client = Selenium::WebDriver::Remote::Http::Default.new(open_timeout: 
 Capybara.register_driver :chrome do |app|
   options = Selenium::WebDriver::Chrome::Options.new
   options.add_emulation(device_metrics: { width: 1440, height: 900, touch: false })
+  # options.add_argument("--start-maximized")
   options.add_preference("intl.accept_languages", "en-US")
   options.logging_prefs = { driver: "DEBUG" }
 
@@ -124,6 +125,18 @@ RSpec.configure do |config|
 
   config.before(:each, type: :system, js: true) do
     driven_by ENV["IN_DOCKER"] == "true" ? :docker_headless_chrome : :chrome
+
+    # Set browser timezone to UTC after driver is initialized
+    Capybara.using_session(Capybara.current_session) do
+      if page.driver.respond_to?(:browser) && page.driver.browser.respond_to?(:execute_cdp)
+        begin
+          page.driver.browser.execute_cdp("Emulation.setTimezoneOverride", timezoneId: "UTC")
+        rescue StandardError
+          # CDP might not be available in all Chrome versions or if browser isn't ready yet
+          # Fail silently - tests will still work, just with system timezone
+        end
+      end
+    end
   end
 
   config.before(:each, :mobile_view) do |example|

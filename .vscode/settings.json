@@ -14,5 +14,7 @@
   "[javascript]": {
     "editor.defaultFormatter": "esbenp.prettier-vscode"
   },
-  "eslint.format.enable": true
+  "eslint.format.enable": true,
+  "makefile.configureOnOpen": false,
+  "git.enabled": true
 }

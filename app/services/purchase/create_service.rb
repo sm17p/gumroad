@@ -126,6 +126,8 @@ class Purchase::CreateService < Purchase::BaseService
 
       validate_bundle_products
 
+      purchase.chargeable = params[:chargeable] if params[:chargeable].present?
+
       purchase.prepare_for_charge!
 
       purchase.build_purchase_wallet_type(wallet_type: params[:wallet_type]) if params[:wallet_type].present?

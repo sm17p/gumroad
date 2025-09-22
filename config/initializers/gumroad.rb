@@ -23,14 +23,15 @@ GUMROAD_MERCHANT_DESCRIPTOR_URL = GlobalConfig.get("MERCHANT_DESCRIPTOR_URL", "g
 GUMROAD_LOGO_URL = GlobalConfig.get("LOGO_URL", "https://gumroad.com/button/button_logo.png")
 
 module GumroadAddress
-  STREET = GlobalConfig.get("ADDRESS_STREET", "548 Market St")
-  CITY = GlobalConfig.get("ADDRESS_CITY", "San Francisco")
-  STATE = GlobalConfig.get("ADDRESS_STATE", "CA")
-  ZIP = GlobalConfig.get("ADDRESS_ZIP", "94104")
-  ZIP_PLUS_FOUR = "#{ZIP}-#{GlobalConfig.get("ADDRESS_ZIP_PLUS_FOUR", "5401")}"
-  COUNTRY = ISO3166::Country[GlobalConfig.get("ADDRESS_COUNTRY", "US")]
+  STREET = GlobalConfig.get("ADDRESS_STREET", "548 Market St").presence || "548 Market St"
+  CITY = GlobalConfig.get("ADDRESS_CITY", "San Francisco").presence || "San Francisco"
+  STATE = GlobalConfig.get("ADDRESS_STATE", "CA").presence || "CA"
+  ZIP = GlobalConfig.get("ADDRESS_ZIP", "94104").presence || "94104"
+  ZIP_PLUS_FOUR = "#{ZIP}-#{GlobalConfig.get("ADDRESS_ZIP_PLUS_FOUR", "5401").presence || "5401"}"
+  COUNTRY_CODE = GlobalConfig.get("ADDRESS_COUNTRY", "US").presence || "US"
+  COUNTRY = ISO3166::Country[COUNTRY_CODE]
 
   def self.full
-    "#{STREET}, #{CITY}, #{STATE} #{ZIP_PLUS_FOUR}, #{COUNTRY.alpha3}"
+    "#{STREET}, #{CITY}, #{STATE} #{ZIP_PLUS_FOUR}, #{COUNTRY&.alpha3 || COUNTRY_CODE}"
   end
 end

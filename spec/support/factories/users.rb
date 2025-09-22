@@ -61,6 +61,31 @@ FactoryBot.define do
       username { "seller" }
       email { "seller@example.com" }
       payment_address { generate(:fixed_email) }
+
+      # to_create do |instance|
+      #   User.find_or_create_by(username: instance.username) do |user|
+      #     user.assign_attributes(
+      #       instance.attributes.except("id", "created_at", "updated_at", "password_digest")
+      #     )
+      #     user.password ||= "-42Q_.c_3628Ca!mW-xTJ8v*"
+      #     user.confirmed_at ||= Time.current
+      #     user.user_risk_state ||= "not_reviewed"
+      #     user.current_sign_in_ip ||= Faker::Internet.ip_v4_address
+      #     user.last_sign_in_ip ||= Faker::Internet.ip_v4_address
+      #     user.account_created_ip ||= Faker::Internet.ip_v4_address
+      #     user.pre_signup_affiliate_request_processed = true if user.pre_signup_affiliate_request_processed.nil?
+      #   end
+      # end
+
+      # Override after(:create) to work with the persisted record from to_create
+      # after(:create) do |user, evaluator|
+      #   # Find the actual persisted record (to_create returns it, but callback receives instance)
+      #   persisted_user = User.find_by(username: user.username) || user
+      #   if persisted_user.persisted?
+      #     persisted_user.update_column(:flags, persisted_user.flags ^ User.flag_mapping["flags"][:tipping_enabled]) unless evaluator.tipping_enabled
+      #     persisted_user.update_column(:flags, persisted_user.flags ^ User.flag_mapping["flags"][:discover_boost_enabled]) unless evaluator.discover_boost_enabled
+      #   end
+      # end
     end
 
     factory :named_user do

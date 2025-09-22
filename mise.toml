@@ -1,0 +1,893 @@
+# # mise config files are hierarchical. mise will find all of the config files
+# # in all parent directories and merge them together.
+# # You might have a structure like:
+#
+# * ~/work/project/mise.toml   # a config file for a specific work project
+# * ~/work/mise.toml           # a config file for projects related to work
+# * ~/.config/mise/config.toml # the global config file
+# * /etc/mise/config.toml      # the system config file
+#
+# # This setup allows you to define default versions and configuration across
+# # all projects but override them for specific projects.
+#
+# # set arbitrary env vars to be used whenever in this project or subprojects
+[env]
+DISABLE_SPRING="1"
+SSL_CERT_FILE="/Users/yoda/github/antiwork/gumroad/tmp/combined_ca_certs.pem"
+NODE_EXTRA_CA_CERTS="/Users/yoda/Library/Application Support/mkcert/rootCA.pem"
+LOCAL_PROXY_DOMAIN="better-sturgeon-evidently.ngrok-free.app"
+# VCR_DEBUG=1
+# NODE_ENV = "development"
+# NPM_CONFIG_PREFIX = "~/.npm-global"
+# EDITOR = "code --wait"
+#
+mise.file = ".env"                # load vars from a dotenv file
+# mise.path = "./node_modules/.bin" # add a directory to PATH
+#
+# [plugins]
+# # specify a custom repo url so you can install with `mise plugin add <name>`
+# # note this will only be used if the plugin is not already installed
+# python = 'https://github.com/asdf-community/asdf-python'
+#
+
+# 🔧 Port Management & Cleanup
+[tasks.kill-port]
+description = "Kill process on specific port"
+run = '''
+#!/usr/bin/env bash
+if [ $# -eq 0 ]; then
+    echo "Usage: mise run kill-port <port>"
+    exit 1
+fi
+
+port=$1
+
+# Validate port number
+if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+    echo "⚠️  Invalid port: $port (must be 1024-65535)"
+    exit 1
+fi
+
+# Check if anything is running on the port
+if lsof -i :$port 2>/dev/null | grep LISTEN > /dev/null; then
+    # Get process info before killing
+    process_info=$(lsof -i :$port | grep LISTEN | head -1)
+    process_name=$(echo "$process_info" | awk '{print $1}')
+    pid=$(echo "$process_info" | awk '{print $2}')
+
+    echo "🔪 Killing process on port $port:"
+    echo "   Process: $process_name (PID: $pid)"
+
+    # Kill with error handling
+    if kill -9 "$pid" 2>/dev/null; then
+        echo "   ✅ Successfully killed process $pid"
+    else
+        echo "   ❌ Failed to kill process $pid (may require sudo)"
+        exit 1
+    fi
+else
+    echo "ℹ️  No process running on port $port"
+fi
+'''
+
+[tasks.kill-test-ports]
+description = "Kill all test environment ports"
+run = '''
+#!/usr/bin/env bash
+echo "🧹 Cleaning up test ports..."
+
+# Kill test ports with better feedback
+test_ports=(31337 3036 8082 50052)
+for port in "${test_ports[@]}"; do
+    mise run kill-port $port
+done
+
+# Clean up Rails PID file
+if [ -f tmp/pids/server.pid ]; then
+    echo "🧹 Removing Rails PID file"
+    rm -f tmp/pids/server.pid
+fi
+
+echo "✅ Test port cleanup complete"
+'''
+
+[tasks.kill-dev-ports]
+description = "Kill all development environment ports"
+run = '''
+#!/usr/bin/env bash
+echo "🧹 Cleaning up development ports..."
+
+# Kill development ports with better feedback
+dev_ports=(3000 3035 8080 50051)
+for port in "${dev_ports[@]}"; do
+    mise run kill-port $port
+done
+
+# Clean up Rails PID file
+if [ -f tmp/pids/server.pid ]; then
+    echo "🧹 Removing Rails PID file"
+    rm -f tmp/pids/server.pid
+fi
+
+echo "✅ Development port cleanup complete"
+'''
+
+[tasks.status]
+description = "Show status of all services"
+run = '''
+#!/usr/bin/env bash
+echo "📊 Service Status:"
+echo ""
+echo "Test Environment:"
+for port in 31337 3036 8081 50052; do
+    if lsof -i :$port 2>/dev/null | grep LISTEN > /dev/null; then
+        process=$(lsof -i :$port | grep LISTEN | awk '{print $1}' | head -1)
+        echo "  Port $port: ✅ ACTIVE ($process)"
+    else
+        echo "  Port $port: ❌ INACTIVE"
+    fi
+done
+
+echo ""
+echo "Development Environment:"
+for port in 3000 3035 8080 50051; do
+    if lsof -i :$port 2>/dev/null | grep LISTEN > /dev/null; then
+        process=$(lsof -i :$port | grep LISTEN | awk '{print $1}' | head -1)
+        echo "  Port $port: ✅ ACTIVE ($process)"
+    else
+        echo "  Port $port: ❌ INACTIVE"
+    fi
+done
+'''
+
+[tasks.db-seed]
+description = "seed database"
+run = '''
+#!/usr/bin/env bash
+echo "📊 Seeding:"
+echo ""
+RAILS_ENV=test bundle exec bin/rails db:drop db:setup
+'''
+
+[tasks.cleanup]
+description = "Clean up everything (ports, temp files, etc.)"
+run = '''
+#!/usr/bin/env bash
+echo "🧹 Full cleanup..."
+mise run kill-test-ports
+mise run kill-dev-ports
+rm -f tmp/pids/server.pid
+rm -f Procfile.*.tmp
+rm -f test_server.log
+echo "✅ Cleanup complete"
+'''
+
+# 🧪 Test Environment Tasks
+[tasks.setup-test-assets]
+description = "Setup test assets (regenerate routes + compile assets)"
+run = '''
+#!/usr/bin/env bash
+set -e
+echo "🧪 Setting up test assets and configuration..."
+
+# Clean existing test assets
+rm -rf public/packs-test/ tmp/shakapacker/
+echo "✓ Cleaned existing test assets"
+
+# Regenerate JS routes with test environment configuration
+RAILS_ENV=test bundle exec rake js:export
+echo "✓ Regenerated JS routes with test config"
+
+# Verify routes were generated correctly
+if grep -q "app.test.gumroad.com:31337" app/javascript/utils/routes.js; then
+    echo "✓ JS routes verified - test domain found"
+else
+    echo "✗ ERROR: Test domain not found in JS routes"
+    exit 1
+fi
+
+# Compile assets for test environment
+RAILS_ENV=test bin/shakapacker
+echo "✓ Compiled test assets"
+
+# Verify no dev URLs in compiled assets
+if find public/packs-test -name "*.js" -exec grep -l "gumroad.dev" {} \; 2>/dev/null | grep -q .; then
+    echo "✗ ERROR: Found development URLs in compiled test assets"
+    exit 1
+else
+    echo "✓ Verified no development URLs in test assets"
+fi
+
+echo ""
+echo "🎉 Test assets setup completed!"
+echo "   Run: mise run test-dev (for full test environment)"
+echo "   Or: mise run test spec/requests/purchases/tipping_spec.rb:11"
+'''
+
+[tasks.test-dev]
+description = "Start full test development environment (like bin/dev for tests)"
+run = '''
+#!/usr/bin/env bash
+set -e
+
+# Clean up any existing test processes
+echo "🧹 Cleaning up existing test processes..."
+mise run kill-test-ports
+
+# Ensure test assets are setup
+echo "🧪 Setting up test development environment..."
+mise run setup-test-assets
+
+echo ""
+echo "🚀 Starting test development servers..."
+echo "   Rails server: http://app.test.gumroad.com:31337"
+echo "   Shakapacker: http://127.0.0.1:3036"
+echo "   Press Ctrl+C to stop all servers"
+echo ""
+
+# Create a temporary Procfile for test environment
+cat > Procfile.test.tmp << 'EOF'
+web: RAILS_ENV=test ./bin/rails s -b 0.0.0.0 -p 31337
+webpack: ./bin/shakapacker-dev-server-test
+webpack-ssr: WEBPACK_SSR=true RAILS_ENV=test ./bin/shakapacker --watch
+sidekiq: RAILS_ENV=test RAILS_MAX_THREADS=5 USE_DB_WORKER_REPLICAS=true bundle exec sidekiq -q critical -q default -q low -q mongo
+anycable_rpc: RAILS_ENV=test ANYCABLE_SECRET="anycable-test-secret" ANYCABLE_RPC_HOST="localhost:50052" bundle exec anycable
+anycable_ws: RAILS_ENV=test ANYCABLE_HOST="cable.test.gumroad.com" ANYCABLE_PORT="8081" ANYCABLE_RPC_HOST="localhost:50052" ANYCABLE_SECRET="anycable-test-secret" ANYCABLE_BROADCAST_ADAPTER="http,redisx" ANYCABLE_PUBSUB="redis" ANYCABLE_BROKER="memory" ANYCABLE_METRICS_PORT="8081" ANYCABLE_LOG_LEVEL="debug" ANYCABLE_DEBUG=true bin/anycable-go
+EOF
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "🧹 Cleaning up..."
+    rm -f Procfile.test.tmp
+}
+trap cleanup EXIT INT TERM
+
+# Check if foreman is available
+if ! command -v foreman &> /dev/null; then
+    echo "Installing foreman..."
+    gem install foreman
+fi
+
+# Start all test services with foreman
+foreman start -f Procfile.test.tmp "$@"
+'''
+
+# 🔧 Granular Server Management (without recompilation)
+[tasks.test-rails]
+description = "Start just the Rails server for tests (no asset compilation)"
+run = '''
+#!/usr/bin/env bash
+echo "🧪 Starting Rails server for test environment..."
+# Clean up Rails test port
+mise run kill-port 31337
+rm -f tmp/pids/server.pid
+echo "   Server: http://app.test.gumroad.com:31337"
+echo "   Press Ctrl+C to stop"
+echo ""
+RAILS_ENV=test ./bin/rails s -b 0.0.0.0 -p 31337
+'''
+
+[tasks.test-webpack]
+description = "Start just the shakapacker dev server for tests (no compilation)"
+run = '''
+#!/usr/bin/env bash
+echo "🧪 Starting shakapacker dev server for tests..."
+# Clean up shakapacker test port
+mise run kill-port 3036
+echo "   Server: http://127.0.0.1:3036"
+echo "   Press Ctrl+C to stop"
+echo ""
+./bin/shakapacker-dev-server-test
+'''
+
+[tasks.routes-test]
+description = "Just regenerate JS routes for test environment (no asset compilation)"
+run = '''
+#!/usr/bin/env bash
+echo "🧪 Regenerating JavaScript routes for test environment..."
+RAILS_ENV=test bundle exec rake js:export
+
+if grep -q "app.test.gumroad.com:31337" app/javascript/utils/routes.js; then
+    echo "✓ JS routes generated with test domain configuration"
+else
+    echo "✗ ERROR: Test domain not found in JS routes"
+    exit 1
+fi
+'''
+
+[tasks.routes-dev]
+description = "Just regenerate JS routes for development environment (no asset compilation)"
+run = '''
+#!/usr/bin/env bash
+echo "🚀 Regenerating JavaScript routes for development environment..."
+RAILS_ENV=development bundle exec rake js:export
+
+if grep -q "gumroad.dev" app/javascript/utils/routes.js; then
+    echo "✓ JS routes generated with development domain configuration"
+else
+    echo "✗ ERROR: Development domain not found in JS routes"
+    exit 1
+fi
+'''
+
+[tasks.compile-test]
+description = "Just compile test assets (no route regeneration)"
+run = '''
+#!/usr/bin/env bash
+echo "🧪 Compiling assets for test environment..."
+rm -rf public/packs-test/ tmp/shakapacker/
+RAILS_ENV=test bin/shakapacker
+echo "✓ Test assets compiled"
+'''
+
+# 🚀 Start All Servers (without compilation)
+[tasks.servers-test]
+description = "Start all test servers without asset compilation"
+run = '''
+#!/usr/bin/env bash
+# Clean up any existing test processes
+echo "🧹 Cleaning up existing test processes..."
+mise run kill-test-ports
+
+echo "🧪 Starting all test servers (no compilation)..."
+echo "   Rails: http://app.test.gumroad.com:31337"
+echo "   Shakapacker: http://127.0.0.1:3036"
+echo "   Sidekiq, AnyCable, etc."
+echo "   Press Ctrl+C to stop all servers"
+echo ""
+echo "💡 Tip: Run 'mise run routes-test' first if routes need updating"
+echo ""
+
+# Create a temporary Procfile for test environment servers only
+cat > Procfile.servers-test.tmp << 'EOF'
+web: RAILS_ENV=test ./bin/rails s -b 0.0.0.0 -p 31337
+webpack: ./bin/shakapacker-dev-server-test
+webpack-ssr: WEBPACK_SSR=true RAILS_ENV=test ./bin/shakapacker --watch
+sidekiq: RAILS_ENV=test RAILS_MAX_THREADS=5 USE_DB_WORKER_REPLICAS=true bundle exec sidekiq -q critical -q default -q low -q mongo
+anycable_rpc: RAILS_ENV=test ANYCABLE_SECRET="anycable-test-secret" ANYCABLE_RPC_HOST="localhost:50052" bundle exec anycable
+anycable_ws: RAILS_ENV=test ANYCABLE_HOST="cable.test.gumroad.com" ANYCABLE_PORT="8082" ANYCABLE_RPC_HOST="localhost:50052" ANYCABLE_SECRET="anycable-test-secret" ANYCABLE_BROADCAST_ADAPTER="http,redisx" ANYCABLE_PUBSUB="redis" ANYCABLE_BROKER="memory" ANYCABLE_METRICS_PORT="8082" ANYCABLE_LOG_LEVEL="debug" ANYCABLE_DEBUG=true bin/anycable-go
+EOF
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "🧹 Cleaning up..."
+    rm -f Procfile.servers-test.tmp
+}
+trap cleanup EXIT INT TERM
+
+# Check if foreman is available
+if ! command -v foreman &> /dev/null; then
+    echo "Installing foreman..."
+    gem install foreman
+fi
+
+# Start all test services with foreman
+foreman start -f Procfile.servers-test.tmp "$@"
+'''
+
+[tasks.servers-dev]
+description = "Start all development servers without asset setup"
+run = '''
+#!/usr/bin/env bash
+# Clean up any existing development processes
+echo "🧹 Cleaning up existing development processes..."
+mise run kill-dev-ports
+
+echo "🚀 Starting all development servers (no asset setup)..."
+echo "   This is equivalent to bin/dev but without asset setup"
+echo "   Press Ctrl+C to stop all servers"
+echo ""
+echo "💡 Tip: Run 'mise run routes-dev' first if routes need updating"
+echo ""
+
+# Ensure SSL certificates are set up
+if [ -z "$SSL_CERT_FILE" ] || [ ! -f "$SSL_CERT_FILE" ]; then
+  echo "⚠️  SSL_CERT_FILE not set or file missing, setting up..."
+  mise run setup-ssl-certs
+  export SSL_CERT_FILE="/Users/yoda/github/antiwork/gumroad/tmp/combined_ca_certs.pem"
+fi
+
+# Check if foreman is available
+if ! command -v foreman &> /dev/null; then
+    echo "Installing foreman..."
+    gem install foreman
+fi
+
+# Start development services using existing Procfile.dev
+# Export SSL_CERT_FILE so all processes inherit it
+export SSL_CERT_FILE="${SSL_CERT_FILE:-/Users/yoda/github/antiwork/gumroad/tmp/combined_ca_certs.pem}"
+export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-/Users/yoda/Library/Application Support/mkcert/rootCA.pem}"
+foreman start -f Procfile.dev "$@"
+'''
+
+# 🎯 Convenient Short Aliases
+[tasks.st]
+description = "Alias for 'servers-test' - Start all test servers quickly"
+run = '''
+#!/usr/bin/env bash
+exec mise run servers-test "$@"
+'''
+
+[tasks.sd]
+description = "Alias for 'servers-dev' - Start all dev servers quickly"
+run = '''
+#!/usr/bin/env bash
+exec mise run servers-dev "$@"
+'''
+
+[tasks.rt]
+description = "Alias for 'routes-test' - Quick test routes regeneration"
+run = '''
+#!/usr/bin/env bash
+exec mise run routes-test "$@"
+'''
+
+[tasks.rd]
+description = "Alias for 'routes-dev' - Quick dev routes regeneration"
+run = '''
+#!/usr/bin/env bash
+exec mise run routes-dev "$@"
+'''
+
+# 🔄 Restart Commands
+[tasks.restart-test]
+description = "Restart all test servers (kill ports + start servers)"
+run = '''
+#!/usr/bin/env bash
+echo "🔄 Restarting test servers..."
+mise run kill-test-ports
+echo ""
+exec mise run servers-test "$@"
+'''
+
+[tasks.restart-dev]
+description = "Restart all development servers (kill ports + start servers)"
+run = '''
+#!/usr/bin/env bash
+echo "🔄 Restarting development servers..."
+mise run kill-dev-ports
+echo ""
+exec mise run servers-dev "$@"
+'''
+
+[tasks.rst]
+description = "Alias for 'restart-test' - Quick test restart"
+run = '''
+#!/usr/bin/env bash
+exec mise run restart-test "$@"
+'''
+
+[tasks.rsd]
+description = "Alias for 'restart-dev' - Quick dev restart"
+run = '''
+#!/usr/bin/env bash
+exec mise run restart-dev "$@"
+'''
+
+[tasks.test]
+description = "Run tests with proper asset setup"
+run = '''
+#!/usr/bin/env bash
+if [ $# -eq 0 ]; then
+    echo "Usage: mise run test <rspec-arguments>"
+    echo "Example: mise run test spec/requests/purchases/tipping_spec.rb:11"
+    exit 1
+fi
+
+echo "🎯 Full test setup and run for: $*"
+mise run setup-test-assets
+echo ""
+echo "🧪 Running tests: bundle exec bin/rspec $*"
+bundle exec bin/rspec "$@"
+'''
+
+# 🚀 Development Environment Tasks
+[tasks.setup-dev-assets]
+description = "Setup development assets (regenerate routes)"
+run = '''
+#!/usr/bin/env bash
+set -e
+echo "🚀 Setting up development assets and configuration..."
+
+# Clean existing dev assets cache
+rm -rf tmp/shakapacker/
+echo "✓ Cleaned development asset cache"
+
+# Regenerate JS routes with development environment configuration
+RAILS_ENV=development bundle exec rake js:export
+echo "✓ Regenerated JS routes with development config"
+
+# Verify routes were generated correctly
+if grep -q "gumroad.dev" app/javascript/utils/routes.js; then
+    echo "✓ JS routes verified - development domain found"
+else
+    echo "✗ ERROR: Development domain not found in JS routes"
+    exit 1
+fi
+
+echo ""
+echo "🎉 Development assets setup completed!"
+echo "   Your regular bin/dev should now work correctly"
+'''
+
+[tasks.dev]
+description = "Start development environment (calls bin/dev)"
+run = '''
+#!/usr/bin/env bash
+# Clean up any existing development processes
+echo "🧹 Cleaning up existing development processes..."
+mise run kill-dev-ports
+
+echo "🚀 Setting up and starting development environment..."
+mise run setup-dev-assets
+echo ""
+echo "🚀 Starting development servers via bin/dev..."
+exec bin/dev "$@"
+'''
+
+# 🔍 Debug & Utility Tasks
+[tasks.verify-test-config]
+description = "Verify test environment configuration"
+run = '''
+#!/usr/bin/env bash
+echo "🧪 Verifying test configuration..."
+echo ""
+RAILS_ENV=test ruby -e "
+require './config/environment'
+puts \"RAILS_ENV: #{Rails.env}\"
+puts \"PROTOCOL: #{PROTOCOL}\"
+puts \"DOMAIN: #{DOMAIN}\"
+puts \"ROOT_DOMAIN: #{ROOT_DOMAIN}\"
+puts \"UrlService.domain_with_protocol: #{UrlService.domain_with_protocol}\"
+"
+'''
+
+[tasks.verify-dev-config]
+description = "Verify development environment configuration"
+run = '''
+#!/usr/bin/env bash
+echo "🚀 Verifying development configuration..."
+echo ""
+RAILS_ENV=development ruby -e "
+require './config/environment'
+puts \"RAILS_ENV: #{Rails.env}\"
+puts \"PROTOCOL: #{PROTOCOL}\"
+puts \"DOMAIN: #{DOMAIN}\"
+puts \"ROOT_DOMAIN: #{ROOT_DOMAIN}\"
+puts \"UrlService.domain_with_protocol: #{UrlService.domain_with_protocol}\"
+"
+'''
+
+[tasks.check-domain-conflicts]
+description = "Check for domain conflicts in compiled assets"
+run = '''
+#!/usr/bin/env bash
+echo "🔍 Checking for domain conflicts in compiled assets..."
+echo ""
+
+if [ -d "public/packs-test" ]; then
+    echo "Test assets (should only have test.gumroad.com):"
+    dev_urls_in_test=$(find public/packs-test -name "*.js" -exec grep -l "gumroad.dev" {} \; 2>/dev/null)
+    if [ -n "$dev_urls_in_test" ]; then
+        echo "⚠️  Found development URLs in test assets!"
+        echo "$dev_urls_in_test" | head -5
+    else
+        echo "✓ No development URLs found in test assets"
+    fi
+    echo ""
+fi
+
+if [ -d "public/packs" ]; then
+    echo "Development assets (should only have gumroad.dev):"
+    test_urls_in_dev=$(find public/packs -name "*.js" -exec grep -l "test.gumroad.com" {} \; 2>/dev/null)
+    if [ -n "$test_urls_in_dev" ]; then
+        echo "⚠️  Found test URLs in development assets!"
+        echo "$test_urls_in_dev" | head -5
+    else
+        echo "✓ No test URLs found in development assets"
+    fi
+fi
+'''
+
+[tasks.asset-status]
+description = "Show asset compilation status"
+run = '''
+#!/usr/bin/env bash
+echo "📊 Asset compilation status:"
+echo ""
+
+if [ -d "public/packs-test" ]; then
+    js_count=$(find public/packs-test -name "*.js" | wc -l | tr -d ' ')
+    manifest_status=$([ -f "public/packs-test/manifest.json" ] && echo "✓ Present" || echo "✗ Missing")
+    echo "✓ Test assets: $js_count JS files"
+    echo "  Manifest: $manifest_status"
+    echo "  Note: Test env compiles all assets but may show fewer initially"
+else
+    echo "✗ Test assets: Not compiled"
+    echo "  Run: mise run setup-test-assets or mise run compile-test"
+fi
+echo ""
+
+if [ -d "public/packs" ]; then
+    js_count=$(find public/packs -name "*.js" | wc -l | tr -d ' ')
+    manifest_status=$([ -f "public/packs/manifest.json" ] && echo "✓ Present" || echo "✗ Missing")
+    echo "✓ Dev assets: $js_count JS files"
+    echo "  Manifest: $manifest_status"
+    echo "  Note: Dev env compiles all assets for hot reloading"
+else
+    echo "✗ Dev assets: Not compiled"
+    echo "  Run: bin/dev or mise run setup-dev-assets"
+fi
+'''
+
+# 🧹 Cleanup Tasks
+[tasks.clean-assets]
+description = "Clean all compiled assets"
+run = '''
+echo "🧹 Cleaning all compiled assets..."
+rm -rf public/packs/ public/packs-test/ tmp/shakapacker/
+echo "✓ All assets cleaned"
+'''
+
+[tasks.clean-test-assets]
+description = "Clean only test assets"
+run = '''
+echo "🧹 Cleaning test assets..."
+rm -rf public/packs-test/
+echo "✓ Test assets cleaned"
+'''
+
+# 🌐 Chrome Debugging
+[tasks.chrome-debug]
+description = "Start Chrome with debugging enabled for MCP server"
+run = '''
+#!/usr/bin/env bash
+echo "🌐 Starting Chrome with debugging enabled..."
+echo "   Debug port: 9222"
+echo "   User data: /tmp/chrome-profile-stable"
+echo "   Press Ctrl+C to stop"
+echo ""
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-profile-stable --start-maximized
+'''
+
+# 🔒 SSL Certificate Management
+[tasks.setup-ssl-certs]
+description = "Setup SSL certificates (combines OpenSSL and mkcert certs) - one-time setup"
+run = '''
+#!/usr/bin/env bash
+echo "🔒 Setting up SSL certificates..."
+echo ""
+
+default_cert_file=$(ruby -ropenssl -e 'puts OpenSSL::X509::DEFAULT_CERT_FILE')
+mkcert_root_ca_file="$(mkcert -CAROOT)/rootCA.pem"
+combined_cert_file="tmp/combined_ca_certs.pem"
+
+echo "Default OpenSSL cert: $default_cert_file"
+if [ -f "$default_cert_file" ]; then
+  echo "  ✓ Exists ($(wc -l < "$default_cert_file" | tr -d ' ') lines)"
+else
+  echo "  ✗ Missing!"
+fi
+
+echo ""
+echo "mkcert root CA: $mkcert_root_ca_file"
+if [ -f "$mkcert_root_ca_file" ]; then
+  echo "  ✓ Exists ($(wc -l < "$mkcert_root_ca_file" | tr -d ' ') lines)"
+else
+  echo "  ✗ Missing! Run: mkcert -install"
+fi
+
+echo ""
+if [ -f "$default_cert_file" ] && [ -f "$mkcert_root_ca_file" ]; then
+  mkdir -p tmp
+  cat "$default_cert_file" "$mkcert_root_ca_file" > "$combined_cert_file"
+  echo "✓ Combined certificates created at $combined_cert_file"
+  echo "  ($(wc -l < "$combined_cert_file" | tr -d ' ') total lines)"
+  echo ""
+  echo "SSL_CERT_FILE is set in mise.toml to: ${PWD}/tmp/combined_ca_certs.pem"
+else
+  echo "⚠️  Warning: Could not create combined cert file"
+  echo "  Using default cert file: $default_cert_file"
+fi
+'''
+
+[tasks.debug-ssl]
+description = "Debug SSL certificate configuration and test connections"
+run = '''
+#!/usr/bin/env bash
+echo "🔍 SSL Certificate Debug Information"
+echo "===================================="
+echo ""
+
+echo "Environment Variables:"
+echo "  SSL_CERT_FILE: ${SSL_CERT_FILE:-not set}"
+echo "  NODE_EXTRA_CA_CERTS: ${NODE_EXTRA_CA_CERTS:-not set}"
+echo ""
+
+default_cert_file=$(ruby -ropenssl -e 'puts OpenSSL::X509::DEFAULT_CERT_FILE')
+echo "Default OpenSSL cert file: $default_cert_file"
+if [ -f "$default_cert_file" ]; then
+  cert_count=$(grep -c "BEGIN CERTIFICATE" "$default_cert_file" || echo "0")
+  echo "  ✓ Exists (contains $cert_count certificates)"
+
+  # Test if we can read it
+  if openssl x509 -in "$default_cert_file" -text -noout > /dev/null 2>&1; then
+    echo "  ✓ Valid format"
+  else
+    echo "  ⚠️  Warning: May have format issues"
+  fi
+else
+  echo "  ✗ Missing!"
+fi
+
+echo ""
+mkcert_root_ca_file="$(mkcert -CAROOT)/rootCA.pem"
+echo "mkcert root CA: $mkcert_root_ca_file"
+if [ -f "$mkcert_root_ca_file" ]; then
+  echo "  ✓ Exists"
+else
+  echo "  ✗ Missing"
+fi
+
+echo ""
+combined_cert_file="tmp/combined_ca_certs.pem"
+echo "Combined cert file: $combined_cert_file"
+if [ -f "$combined_cert_file" ]; then
+  cert_count=$(grep -c "BEGIN CERTIFICATE" "$combined_cert_file" || echo "0")
+  file_size=$(ls -lh "$combined_cert_file" | awk '{print $5}')
+  echo "  ✓ Exists ($cert_count certificates, $file_size)"
+  echo "  Last modified: $(stat -f "%Sm" "$combined_cert_file" 2>/dev/null || stat -c "%y" "$combined_cert_file" 2>/dev/null)"
+else
+  echo "  ✗ Missing - run: mise run setup-ssl-certs"
+fi
+
+echo ""
+echo "Testing SSL connection to api.resend.com..."
+if curl -s --max-time 5 --cacert "${SSL_CERT_FILE:-$default_cert_file}" https://api.resend.com > /dev/null 2>&1; then
+  echo "  ✓ Connection successful"
+else
+  echo "  ✗ Connection failed"
+  echo ""
+  echo "Testing with verbose output:"
+  curl -v --max-time 5 --cacert "${SSL_CERT_FILE:-$default_cert_file}" https://api.resend.com 2>&1 | grep -i "certificate\|ssl\|error" | head -10
+fi
+
+echo ""
+echo "Testing SSL connection to api.sendgrid.com..."
+if curl -s --max-time 5 --cacert "${SSL_CERT_FILE:-$default_cert_file}" https://api.sendgrid.com > /dev/null 2>&1; then
+  echo "  ✓ Connection successful"
+else
+  echo "  ✗ Connection failed"
+fi
+'''
+
+[tasks.activate-resend]
+description = "Activate Resend for post emails (force all emails through Resend)"
+run = '''
+#!/usr/bin/env bash
+echo "🔧 Activating Resend for post emails..."
+echo ""
+
+# Get seller email from user or use default
+SELLER_EMAIL="${1:-seller@gumroad.com}"
+
+echo "Activating Resend for: $SELLER_EMAIL"
+echo ""
+
+cd /Users/yoda/github/antiwork/gumroad
+export SSL_CERT_FILE="/Users/yoda/github/antiwork/gumroad/tmp/combined_ca_certs.pem"
+
+rails runner <<RUBY
+user = User.find_by(email: "$SELLER_EMAIL")
+if user.nil?
+  puts "❌ User not found: $SELLER_EMAIL"
+  puts "   Available users:"
+  User.limit(5).each { |u| puts "     - #{u.email}" }
+  exit 1
+end
+
+puts "Found user: #{user.email} (ID: #{user.id})"
+puts ""
+
+# Activate force_resend_for_post_emails to force all emails through Resend
+Feature.activate_user(:force_resend_for_post_emails, user)
+puts "✓ Activated: force_resend_for_post_emails"
+puts "  All post emails will now go through Resend"
+puts ""
+
+# Also activate use_resend_for_post_emails for routing
+Feature.activate_user(:use_resend_for_post_emails, user)
+puts "✓ Activated: use_resend_for_post_emails"
+puts ""
+
+# Verify
+if Feature.active?(:force_resend_for_post_emails, user)
+  puts "✅ Resend is now active for #{user.email}"
+  puts "   All post emails will be sent via Resend"
+else
+  puts "❌ Failed to activate Resend"
+end
+RUBY
+'''
+
+# 🌐 Ngrok Tunnel
+[tasks.ngrok]
+description = "Start ngrok tunnel to Rails development server (port 3000) with custom URL"
+run = '''
+#!/usr/bin/env bash
+# Get ngrok domain from LOCAL_PROXY_DOMAIN (strip https:// if present)
+NGROK_DOMAIN="${LOCAL_PROXY_DOMAIN:-better-sturgeon-evidently.ngrok-free.app}"
+NGROK_DOMAIN="${NGROK_DOMAIN#https://}"
+NGROK_DOMAIN="${NGROK_DOMAIN#http://}"
+
+echo "🌐 Starting ngrok tunnel to Rails server (port 3000)..."
+echo "   Local: http://localhost:3000"
+echo "   Public URL: https://${NGROK_DOMAIN}"
+echo "   Press Ctrl+C to stop"
+echo ""
+echo "💡 Use this URL in Resend webhook configuration:"
+echo "   https://${NGROK_DOMAIN}/resend-webhook"
+echo ""
+echo "💡 LOCAL_PROXY_DOMAIN is set to: ${LOCAL_PROXY_DOMAIN:-not set}"
+echo ""
+npx --yes ngrok http --url="${NGROK_DOMAIN}" 3000
+'''
+
+# 💡 Help & Information
+[tasks.info]
+description = "Show available commands and usage examples"
+run = '''
+#!/usr/bin/env bash
+echo "🚀 Gumroad Test/Dev Asset Management"
+echo ""
+echo "🧪 Test Environment:"
+echo "   mise run test-dev                    # Full setup + start all test services"
+echo "   mise run servers-test  (or: st)      # Just start all test servers (no compilation)"
+echo "   mise run test spec/path/to/test.rb   # Quick test with auto asset setup"
+echo ""
+echo "🚀 Development Environment:"
+echo "   mise run dev                         # Full setup + start bin/dev"
+echo "   mise run servers-dev  (or: sd)       # Just start all dev servers (no setup)"
+echo ""
+echo "🔄 Quick Restart:"
+echo "   mise run restart-test  (or: rst)     # Kill test ports + restart test servers"
+echo "   mise run restart-dev  (or: rsd)      # Kill dev ports + restart dev servers"
+echo ""
+echo "🔧 Granular Server Control:"
+echo "   mise run test-rails                  # Just Rails server (test mode)"
+echo "   mise run test-webpack                # Just shakapacker dev server (test mode)"
+echo "   mise run routes-test  (or: rt)       # Just regenerate test routes"
+echo "   mise run compile-test                # Just compile test assets"
+echo "   mise run setup-dev-assets            # Full dev asset setup"
+echo "   mise run routes-dev  (or: rd)        # Just regenerate dev routes"
+echo ""
+echo "🔧 Asset Management:"
+echo "   mise run setup-test-assets           # Full test asset setup"
+echo "   mise run clean-assets                # Clean all assets"
+echo ""
+echo "🔍 Debug & Status:"
+echo "   mise run asset-status                # Asset compilation status"
+echo "   mise run status                      # Show service status"
+echo "   mise run check-domain-conflicts      # Check domain conflicts"
+echo "   mise run verify-test-config          # Verify test domain config"
+echo ""
+echo "🧹 Cleanup & Management:"
+echo "   mise run kill-test-ports             # Kill all test ports"
+echo "   mise run kill-dev-ports              # Kill all dev ports"
+echo "   mise run cleanup                     # Full cleanup"
+echo ""
+echo "💡 Pro Tips:"
+echo "   - Use 'mise run st' to quickly start all test servers"
+echo "   - Use 'mise run sd' to quickly start all dev servers"
+echo "   - Use 'mise run rst' to quickly restart test servers"
+echo "   - Use 'mise run status' to see what's running"
+echo "   - Ports are automatically cleaned before starting servers"
+echo "   - Full '*-dev' commands include asset setup, 'servers-*' commands don't"
+echo ""
+echo "📋 All available tasks: mise tasks"
+'''
+
+[tools]
+node = "20.17.0"

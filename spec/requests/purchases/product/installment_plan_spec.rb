@@ -62,6 +62,7 @@ describe "Product with installment plan", type: :system, js: true do
       charge_occurrence_count: 3,
       recurrence: "monthly",
     )
+    expect(purchase.total_price_before_installments_cents).to eq(1000)
     expect(subscription.last_payment_option.installment_plan).to eq(installment_plan)
 
     visit purchase.receipt_url
@@ -70,6 +71,7 @@ describe "Product with installment plan", type: :system, js: true do
     travel_to(1.month.from_now)
     RecurringChargeWorker.new.perform(subscription.id)
     expect(subscription.purchases.successful.count).to eq(2)
+    expect(subscription.purchases.successful.last.total_price_before_installments_cents).to be_nil
     expect(subscription.purchases.successful.last).to have_attributes(
       price_cents: 333,
       is_installment_payment: true,
@@ -274,11 +276,13 @@ describe "Product with installment plan", type: :system, js: true do
         charge_occurrence_count: 3,
         recurrence: "monthly",
       )
+      expect(purchase.total_price_before_installments_cents).to eq(1000)
       expect(subscription.last_payment_option.installment_plan).to eq(installment_plan)
 
       travel_to(1.month.from_now)
       RecurringChargeWorker.new.perform(subscription.id)
       expect(subscription.purchases.successful.count).to eq(2)
+      expect(subscription.purchases.successful.last.total_price_before_installments_cents).to be_nil
       expect(subscription.purchases.successful.last).to have_attributes(
         price_cents: 333,
         is_installment_payment: true,
@@ -547,6 +551,56 @@ describe "Product with installment plan", type: :system, js: true do
                                                             is_original_subscription_purchase: false,
                                                             )
       end
+    end
+  end
+
+  describe "recurring charges with total_price_before_installments_cents" do
+    it "locks price when product price changes" do
+      visit product.long_url
+      click_on "Pay in 3 installments"
+      fill_checkout_form(product)
+      click_on "Pay"
+
+      expect(page).to have_alert(text: "Your purchase was successful! We sent a receipt to test@gumroad.com.")
+
+      purchase = product.sales.last
+      subscription = purchase.subscription
+      expect(purchase).to have_attributes(
+        price_cents: 334,
+        is_installment_payment: true,
+        is_original_subscription_purchase: true,
+      )
+      expect(subscription).to have_attributes(
+        is_installment_plan: true,
+        charge_occurrence_count: 3,
+        recurrence: "monthly",
+      )
+
+      product.update!(price_cents: 60000)
+      subscription.reload
+
+      travel_to(1.month.from_now)
+      RecurringChargeWorker.new.perform(subscription.id)
+      expect(subscription.purchases.recurring_charge.last.price_cents).to eq(333)
+    end
+
+    it "locks installment count when product installment plan changes" do
+      visit product.long_url
+      click_on "Pay in 3 installments"
+      fill_checkout_form(product)
+      click_on "Pay"
+
+      expect(page).to have_alert(text: "Your purchase was successful! We sent a receipt to test@gumroad.com.")
+
+      subscription = product.sales.last.subscription
+      product.installment_plan.destroy_if_no_payment_options!
+      product.reset_installment_plan
+      product.create_installment_plan!(number_of_installments: 5, recurrence: "monthly")
+      subscription.reload
+
+      travel_to(1.month.from_now)
+      RecurringChargeWorker.new.perform(subscription.id)
+      expect(subscription.purchases.recurring_charge.last.price_cents).to eq(333)
     end
   end
 end

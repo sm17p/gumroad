@@ -71,6 +71,7 @@ class Purchase < ApplicationRecord
   attr_json_data_accessor :perceived_price_cents
   attr_json_data_accessor :recommender_model_name
   attr_json_data_accessor :custom_fee_per_thousand
+  attr_json_data_accessor :total_price_before_installments_cents
 
   alias_attribute :total_transaction_cents_usd, :total_transaction_cents
 
@@ -1240,16 +1241,17 @@ class Purchase < ApplicationRecord
     return 0 if is_gift_receiver_purchase
     return perceived_price_cents if perceived_price_cents.present? && is_applying_plan_change
 
-    if is_recurring_subscription_charge
+    if is_recurring_subscription_charge && subscription.is_installment_plan
+      minimum_price = calculate_installment_payment_price_cents
+    elsif is_recurring_subscription_charge
       minimum_price = subscription.current_subscription_price_cents
     elsif is_preorder_charge?
       minimum_price = preorder.authorization_purchase.displayed_price_cents
     else
-      minimum_price_cents = minimum_paid_price_cents_per_unit_before_discount - offer_amount_off(minimum_paid_price_cents_per_unit_before_discount)
-      # We want an offer code to apply to every quantity separately ($2 offer code on 2 CDs = $4 off).
-      minimum_price_cents *= quantity
-
-      minimum_price_cents *= purchasing_power_parity_factor if is_purchasing_power_parity_discounted? && link.purchasing_power_parity_enabled? && original_offer_code.blank?
+      minimum_price_cents = discounted_total_before_installments_cents
+      if is_original_subscription_purchase && is_installment_payment && total_price_before_installments_cents.nil?
+        self.total_price_before_installments_cents = minimum_price_cents
+      end
 
       minimum_price = minimum_price_cents
 
@@ -1258,7 +1260,7 @@ class Purchase < ApplicationRecord
       elsif link.native_type == Link::NATIVE_TYPE_COMMISSION
         minimum_price *= Commission::COMMISSION_DEPOSIT_PROPORTION
       elsif is_installment_payment
-        minimum_price = calculate_installment_payment_price_cents(minimum_price_cents)
+        minimum_price = calculate_installment_payment_price_cents(for_recurring: false, total_price_cents: minimum_price_cents)
       end
 
       # We allow offer codes that are larger than the price of the product. In that case minimum_price_cents could be negative here. Set it to 0.
@@ -2570,8 +2572,7 @@ class Purchase < ApplicationRecord
     else
       total_transaction_amount_for_gumroad_cents * 1.0 / charge.gumroad_amount_cents
     end
-    purchase_seller_portion = (total_transaction_cents - total_transaction_amount_for_gumroad_cents) * 1.0 /
-        (charge.amount_cents - charge.gumroad_amount_cents)
+    purchase_seller_portion = (total_transaction_cents - total_transaction_amount_for_gumroad_cents) * 1.0 / (charge.amount_cents - charge.gumroad_amount_cents)
 
     issued_amount_cents = (total_issued_amount_cents * purchase_portion).floor
     settled_amount_cents = (combined_flow_of_funds.settled_amount.cents * purchase_portion).floor
@@ -2621,1208 +2622,1217 @@ class Purchase < ApplicationRecord
     end
   end
 
-  private
-    def offer_amount_off(purchase_min_price)
-      # For commissions, apply deposit purchase's offer code to its completion
-      # purchase even if it has been soft deleted.
-      original_offer_code(include_deleted: is_commission_completion_purchase?)
-        &.amount_off(purchase_min_price) || 0
+  def calculate_installment_payment_price_cents(for_recurring: is_recurring_subscription_charge, total_price_cents: nil)
+    return unless is_installment_payment
+    plan = installment_plan || subscription&.payment_options&.alive&.order(:id)&.first&.installment_plan || link.installment_plan
+
+    if for_recurring
+      nth_installment = subscription.purchases.successful.count
+      total_price_cents = subscription.original_purchase.total_price_before_installments_cents || subscription.original_purchase.discounted_total_before_installments_cents
+    else
+      nth_installment = 0
+    end
+    plan.price_for_installment(nth_installment, total_price_cents)
+  end
+
+  def discounted_total_before_installments_cents
+    minimum_price_cents = minimum_paid_price_cents_per_unit_before_discount -
+                          offer_amount_off(minimum_paid_price_cents_per_unit_before_discount)
+    # We want an offer code to apply to every quantity separately ($2 offer code on 2 CDs = $4 off).
+    minimum_price_cents *= quantity
+    minimum_price_cents *= purchasing_power_parity_factor if is_purchasing_power_parity_discounted? && link.purchasing_power_parity_enabled? && original_offer_code.blank?
+    minimum_price_cents
+  end
+
+  def offer_amount_off(purchase_min_price)
+    # For commissions, apply deposit purchase's offer code to its completion
+    # purchase even if it has been soft deleted.
+    original_offer_code(include_deleted: is_commission_completion_purchase?)
+      &.amount_off(purchase_min_price) || 0
+  end
+
+  def displayed_price_usd_cents
+    get_usd_cents(displayed_price_currency_type, displayed_price_cents)
+  end
+
+  def transcode_product_videos
+    # Transcode videos immediately after successful purchase
+    link.transcode_videos!(queue: "critical")
+
+    # Videos uploaded in the future would be automatically transcoded since the product would contain at least one
+    # successful purchase. We can disable transcode on purchase to avoid unnecessary transcode attempts.
+    link.transcode_videos_on_purchase = false
+    link.save!
+  end
+
+  def process_without_charging!
+    set_price_and_rate
+    calculate_fees
+    save
+
+    return if is_gift_receiver_purchase
+
+    create_sales_tax_info!
+    return if errors.present?
+
+    calculate_shipping
+    save
+
+    if free_purchase?
+      check_for_blocked_customer_emails
+      return
     end
 
-    def displayed_price_usd_cents
-      get_usd_cents(displayed_price_currency_type, displayed_price_cents)
+    should_prepare_for_charge = !is_test_purchase? && !skip_preparing_for_charge
+    if should_prepare_for_charge
+      unless is_part_of_combined_charge?
+        chargeable = load_chargeable_for_charging
+        return if errors.present?
+
+        validate_chargeable_for_charging(chargeable)
+        return if errors.present?
+
+        chargeable = prepare_chargeable_for_charge!(chargeable)
+        return if errors.present?
+      end
     end
 
-    def transcode_product_videos
-      # Transcode videos immediately after successful purchase
-      link.transcode_videos!(queue: "critical")
+    purchase_sales_tax_info.card_country_code = card_country if is_part_of_combined_charge?
+    calculate_taxes
+    return if errors.present?
 
-      # Videos uploaded in the future would be automatically transcoded since the product would contain at least one
-      # successful purchase. We can disable transcode on purchase to avoid unnecessary transcode attempts.
-      link.transcode_videos_on_purchase = false
-      link.save!
-    end
+    self.price_cents += tax_cents if was_tax_excluded_from_price
+    self.total_transaction_cents = self.price_cents + gumroad_tax_cents
 
-    def process_without_charging!
-      set_price_and_rate
-      calculate_fees
-      save
+    # Actually add the shipping amount to price cents and update total transaction cents
+    self.price_cents += shipping_cents
+    self.total_transaction_cents += shipping_cents
 
-      return if is_gift_receiver_purchase
+    calculate_fees
 
-      create_sales_tax_info!
+    validate_seller_revenue
+    return if errors.present?
+
+    purchase_sales_tax_info.save
+    save
+
+    return unless should_prepare_for_charge
+
+    unless is_part_of_combined_charge?
+      validate_purchasing_power_parity
       return if errors.present?
 
-      calculate_shipping
-      save
-
-      if free_purchase?
-        check_for_blocked_customer_emails
+      if is_preorder_authorization || is_free_trial_purchase?
+        create_setup_intent(chargeable) if setup_future_charges
         return
       end
 
-      should_prepare_for_charge = !is_test_purchase? && !skip_preparing_for_charge
-      if should_prepare_for_charge
-        unless is_part_of_combined_charge?
-          chargeable = load_chargeable_for_charging
-          return if errors.present?
-
-          validate_chargeable_for_charging(chargeable)
-          return if errors.present?
-
-          chargeable = prepare_chargeable_for_charge!(chargeable)
-          return if errors.present?
-        end
-      end
-
-      purchase_sales_tax_info.card_country_code = card_country if is_part_of_combined_charge?
-      calculate_taxes
+      check_for_blocked_customer_emails
       return if errors.present?
+    end
 
-      self.price_cents += tax_cents if was_tax_excluded_from_price
-      self.total_transaction_cents = self.price_cents + gumroad_tax_cents
+    chargeable
+  end
 
-      # Actually add the shipping amount to price cents and update total transaction cents
-      self.price_cents += shipping_cents
-      self.total_transaction_cents += shipping_cents
+  def load_flow_of_funds(processor_charge)
+    processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, self.total_transaction_cents) if StripeChargeProcessor.charge_processor_id != charge_processor_id
+    self.flow_of_funds = if is_part_of_combined_charge?
+      build_flow_of_funds_from_combined_charge(processor_charge.flow_of_funds)
+    else
+      processor_charge.flow_of_funds
+    end
+  end
 
-      calculate_fees
+  def additional_fields_for_creator_app_api
+    alert_string = if self.price_cents == 0 && !link.is_physical
+      "New download of #{link.name}"
+    else
+      "New sale of #{link.name} for #{formatted_total_price}"
+    end
 
-      validate_seller_revenue
-      return if errors.present?
+    {
+      alert: alert_string,
+      product_thumbnail_url: link.thumbnail&.alive&.url.presence,
+      formatted_total_price:,
+      refunded: stripe_refunded?,
+      partially_refunded: stripe_partially_refunded,
+      chargedback: chargedback_not_reversed?,
+    }
+  end
 
-      purchase_sales_tax_info.save
-      save
+  def determine_affiliate_balance_cents
+    return 0 if affiliate.nil?
 
-      return unless should_prepare_for_charge
+    affiliate_cents = affiliate_cut * displayed_price_usd_cents
+    affiliate_cents -= determine_affiliate_fee_cents
+    affiliate_cents.floor
+  end
 
-      unless is_part_of_combined_charge?
-        validate_purchasing_power_parity
-        return if errors.present?
+  def affiliate_cut
+    affiliate.basis_points(product_id: link_id) / 10_000.0
+  end
 
-        if is_preorder_authorization || is_free_trial_purchase?
-          create_setup_intent(chargeable) if setup_future_charges
+  def determine_affiliate_fee_cents
+    return 0 if fee_cents.blank? || (!affiliate.collaborator? && (seller.bears_affiliate_fee? || Feature.active?(:sellers_bear_affiliate_fees)))
+    affiliate_cut * fee_cents
+  end
+
+  # Private: truncate the referrer so that they fit in our mysql string column.
+  def truncate_referrer
+    self.referrer = referrer.first(191) if referrer
+  end
+
+  def validate_seller_revenue
+    return unless price_cents
+    return if price_cents == 0
+    return if price_cents > fee_cents + affiliate_credit_cents
+
+    self.error_code = PurchaseErrorCode::NET_NEGATIVE_SELLER_REVENUE
+    errors.add(:base, "Your purchase failed because the product is not correctly set up. Please contact the creator for more information.")
+  end
+
+  # Private: Prepare for charging the chargeable and retrieve any information about the chargeable that's needed
+  # for risk analysis prior to charge. Will also return a chargeable that may be the same object or a new object.
+  # If a new chargeable is to be converted into a CreditCard for later use by a user, or for a preorder or subscription
+  # then the given chargeable will be used to persist a credit card and then a new chargeable will be created from that
+  # credit card. The new chargeable will be returned.
+  #
+  # Returns: The final chargeable that should be used for charging. May be the same object passed in or different.
+  def prepare_chargeable_for_charge!(chargeable)
+    begin
+      self.card_visual = chargeable.visual
+      self.card_expiry_month = chargeable.expiry_month if chargeable.expiry_month.present?
+      self.card_expiry_year = chargeable.expiry_year if chargeable.expiry_year.present?
+
+      if credit_card.nil? && save_chargeable?
+        self.setup_future_charges = true
+        self.credit_card = CreditCard.create(chargeable, card_data_handling_mode, purchaser)
+
+        if credit_card.errors.present?
+          self.stripe_error_code = credit_card.stripe_error_code
+          self.error_code = credit_card.error_code
+          errors.add :base, credit_card.errors.messages[:base].first
           return
         end
 
-        check_for_blocked_customer_emails
-        return if errors.present?
+        credit_card.users << purchaser if purchaser.present?
       end
 
-      chargeable
-    end
-
-    def load_flow_of_funds(processor_charge)
-      processor_charge.flow_of_funds ||= FlowOfFunds.build_simple_flow_of_funds(Currency::USD, self.total_transaction_cents) if StripeChargeProcessor.charge_processor_id != charge_processor_id
-      self.flow_of_funds = if is_part_of_combined_charge?
-        build_flow_of_funds_from_combined_charge(processor_charge.flow_of_funds)
-      else
-        processor_charge.flow_of_funds
-      end
-    end
-
-    def additional_fields_for_creator_app_api
-      alert_string = if self.price_cents == 0 && !link.is_physical
-        "New download of #{link.name}"
-      else
-        "New sale of #{link.name} for #{formatted_total_price}"
+      # Attach shipping address to the purchaser if option is selected.
+      if save_shipping_address && purchaser.present? && street_address.present?
+        purchaser.update!(
+          street_address:,
+          city:,
+          state:,
+          zip_code:,
+          country:
+        )
       end
 
-      {
-        alert: alert_string,
-        product_thumbnail_url: link.thumbnail&.alive&.url.presence,
-        formatted_total_price:,
-        refunded: stripe_refunded?,
-        partially_refunded: stripe_partially_refunded,
-        chargedback: chargedback_not_reversed?,
-      }
-    end
+      # The chargeable will be prepared and information within the chargeable may be updated or now be available.
+      # The chargeable may also contact a charge processor so this call may not be fast and if the call fails or
+      # the chargeable is declined by the processor (indicated by the false value) we'll stop the purchase here.
+      chargeable.prepare!
 
-    def determine_affiliate_balance_cents
-      return 0 if affiliate.nil?
-
-      affiliate_cents = affiliate_cut * displayed_price_usd_cents
-      affiliate_cents -= determine_affiliate_fee_cents
-      affiliate_cents.floor
-    end
-
-    def affiliate_cut
-      affiliate.basis_points(product_id: link_id) / 10_000.0
-    end
-
-    def determine_affiliate_fee_cents
-      return 0 if fee_cents.blank? || (!affiliate.collaborator? && (seller.bears_affiliate_fee? || Feature.active?(:sellers_bear_affiliate_fees)))
-      affiliate_cut * fee_cents
-    end
-
-    # Private: truncate the referrer so that they fit in our mysql string column.
-    def truncate_referrer
-      self.referrer = referrer.first(191) if referrer
-    end
-
-    def validate_seller_revenue
-      return unless price_cents
-      return if price_cents == 0
-      return if price_cents > fee_cents + affiliate_credit_cents
-
-      self.error_code = PurchaseErrorCode::NET_NEGATIVE_SELLER_REVENUE
-      errors.add(:base, "Your purchase failed because the product is not correctly set up. Please contact the creator for more information.")
-    end
-
-    # Private: Prepare for charging the chargeable and retrieve any information about the chargeable that's needed
-    # for risk analysis prior to charge. Will also return a chargeable that may be the same object or a new object.
-    # If a new chargeable is to be converted into a CreditCard for later use by a user, or for a preorder or subscription
-    # then the given chargeable will be used to persist a credit card and then a new chargeable will be created from that
-    # credit card. The new chargeable will be returned.
-    #
-    # Returns: The final chargeable that should be used for charging. May be the same object passed in or different.
-    def prepare_chargeable_for_charge!(chargeable)
-      begin
-        self.card_visual = chargeable.visual
-        self.card_expiry_month = chargeable.expiry_month if chargeable.expiry_month.present?
-        self.card_expiry_year = chargeable.expiry_year if chargeable.expiry_year.present?
-
-        if credit_card.nil? && save_chargeable?
-          self.setup_future_charges = true
-          self.credit_card = CreditCard.create(chargeable, card_data_handling_mode, purchaser)
-
-          if credit_card.errors.present?
-            self.stripe_error_code = credit_card.stripe_error_code
-            self.error_code = credit_card.error_code
-            errors.add :base, credit_card.errors.messages[:base].first
-            return
-          end
-
-          credit_card.users << purchaser if purchaser.present?
-        end
-
-        # Attach shipping address to the purchaser if option is selected.
-        if save_shipping_address && purchaser.present? && street_address.present?
-          purchaser.update!(
-            street_address:,
-            city:,
-            state:,
-            zip_code:,
-            country:
-          )
-        end
-
-        # The chargeable will be prepared and information within the chargeable may be updated or now be available.
-        # The chargeable may also contact a charge processor so this call may not be fast and if the call fails or
-        # the chargeable is declined by the processor (indicated by the false value) we'll stop the purchase here.
-        chargeable.prepare!
-
-        # after the chargeable is prepared, all information about it is updated into the purchase
-        self.charge_processor_id = chargeable.charge_processor_id
-        self.stripe_fingerprint = chargeable.fingerprint
-        self.card_type = chargeable.card_type
-        self.card_country = chargeable.country
-        purchase_sales_tax_info.card_country_code = chargeable.country
-        self.credit_card_zipcode = chargeable.zip_code
-        self.card_visual = chargeable.visual
-        self.card_expiry_month = chargeable.expiry_month
-        self.card_expiry_year = chargeable.expiry_year
-      rescue ChargeProcessorInvalidRequestError, ChargeProcessorUnavailableError => e
-        logger.error "Error while preparing chargeable: #{e.message} in purchase: #{external_id}"
-        errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
-        self.error_code = charge_processor_unavailable_error
-      rescue ChargeProcessorCardError => e
-        self.stripe_error_code = e.error_code
-        logger.info "Error while preparing chargeable: #{e.message} in purchase: #{external_id}"
-        errors.add :base, PurchaseErrorCode.customer_error_message(e.message)
-      end
-
-      chargeable
-    end
-
-    def save_chargeable?
-      (purchaser.present? && save_card && chargeable&.can_be_saved?) ||
-        is_preorder_authorization? ||
-        link.is_recurring_billing? ||
-        link.native_type == Link::NATIVE_TYPE_COMMISSION ||
-        is_installment_payment
-    end
-
-    def charge_processor_unavailable_error
-      if charge_processor_id.blank? || stripe_charge_processor?
-        PurchaseErrorCode::STRIPE_UNAVAILABLE
-      else
-        PurchaseErrorCode::PAYPAL_UNAVAILABLE
-      end
-    end
-
-    def prepare_merchant_account(charge_processor_id)
-      # Note: This assumes for the time being that all chargeables have only one internal chargeable.
-      self.merchant_account = seller.merchant_account(charge_processor_id)
-      self.merchant_account ||= MerchantAccount.gumroad(charge_processor_id)
-      if merchant_account&.is_a_brazilian_stripe_connect_account? && affiliate.present?
-        self.error_code = PurchaseErrorCode::BRAZILIAN_MERCHANT_ACCOUNT_WITH_AFFILIATE
-        errors.add(:base, "Affiliate sales are not currently supported for this product.")
-      end
-      calculate_fees
-    end
-
-    def create_setup_intent(chargeable)
-      with_charge_processor_error_handler do
-        self.setup_intent = ChargeProcessor.setup_future_charges!(self.merchant_account, chargeable,
-                                                                  mandate_options: mandate_options_for_stripe(with_currency: true))
-        return unless setup_intent.present?
-
-        self.processor_setup_intent_id = setup_intent.id
-        credit_card.update!(json_data: { stripe_setup_intent_id: setup_intent.id }) if credit_card&.requires_mandate?
-        save!
-
-        unless setup_intent.succeeded? || setup_intent.requires_action?
-          errors.add :base, "Sorry, something went wrong."
-        end
-      end
-    end
-
-    def create_charge_intent(chargeable, off_session: true)
-      with_charge_processor_error_handler do
-        amount_cents = total_transaction_cents
-        amount_for_gumroad_cents = total_transaction_amount_for_gumroad_cents
-        description = "You bought #{link.long_url}!"
-        mandate_options = mandate_options_for_stripe
-
-        charge_intent = ChargeProcessor.create_payment_intent_or_charge!(self.merchant_account,
-                                                                         chargeable,
-                                                                         amount_cents,
-                                                                         amount_for_gumroad_cents,
-                                                                         external_id,
-                                                                         description,
-                                                                         statement_description:,
-                                                                         transfer_group: id,
-                                                                         off_session:,
-                                                                         setup_future_charges:,
-                                                                         mandate_options:)
-
-        if charge_intent.id.present?
-          if processor_payment_intent.present?
-            processor_payment_intent.update!(intent_id: charge_intent.id)
-          else
-            create_processor_payment_intent!(intent_id: charge_intent.id)
-          end
-        end
-        save!
-        credit_card.update!(json_data: { stripe_payment_intent_id: charge_intent.id }) if credit_card&.requires_mandate? && mandate_options.present?
-
-        charge_intent
-      end
-    end
-
-    def with_charge_processor_error_handler
-      yield
+      # after the chargeable is prepared, all information about it is updated into the purchase
+      self.charge_processor_id = chargeable.charge_processor_id
+      self.stripe_fingerprint = chargeable.fingerprint
+      self.card_type = chargeable.card_type
+      self.card_country = chargeable.country
+      purchase_sales_tax_info.card_country_code = chargeable.country
+      self.credit_card_zipcode = chargeable.zip_code
+      self.card_visual = chargeable.visual
+      self.card_expiry_month = chargeable.expiry_month
+      self.card_expiry_year = chargeable.expiry_year
     rescue ChargeProcessorInvalidRequestError, ChargeProcessorUnavailableError => e
-      logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
+      logger.error "Error while preparing chargeable: #{e.message} in purchase: #{external_id}"
       errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
       self.error_code = charge_processor_unavailable_error
-      nil
-    rescue ChargeProcessorPayeeAccountRestrictedError => e
-      logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
-      errors.add :base, "There is a problem with creator's paypal account, please try again later (your card was not charged)."
-      self.stripe_error_code = PurchaseErrorCode::PAYPAL_MERCHANT_ACCOUNT_RESTRICTED
-      nil
-    rescue ChargeProcessorPayerCancelledBillingAgreementError => e
-      logger.error "Error while creating charge: #{e.message} in purchase: #{external_id}"
-      errors.add :base, "Customer has cancelled the billing agreement on PayPal."
-      self.stripe_error_code = PurchaseErrorCode::PAYPAL_PAYER_CANCELLED_BILLING_AGREEMENT
-      nil
-    rescue ChargeProcessorPaymentDeclinedByPayerAccountError => e
-      logger.error "Error while creating charge: #{e.message} in purchase: #{external_id}"
-      errors.add :base, "Customer PayPal account has declined the payment."
-      self.stripe_error_code = PurchaseErrorCode::PAYPAL_PAYER_ACCOUNT_DECLINED_PAYMENT
-      nil
-    rescue ChargeProcessorUnsupportedPaymentTypeError => e
-      logger.info "Charge processor error: Unsupported paypal payment method selected"
-      errors.add :base, "We weren't able to charge your PayPal account. Please select another method of payment."
-      self.stripe_error_code = e.error_code
-      self.stripe_transaction_id = e.charge_id
-      nil
-    rescue ChargeProcessorUnsupportedPaymentAccountError => e
-      logger.info "Charge processor error: PayPal account used is not supported"
-      errors.add :base, "Your PayPal account cannot be charged. Please select another method of payment."
-      self.stripe_error_code = e.error_code
-      self.stripe_transaction_id = e.charge_id
-      nil
     rescue ChargeProcessorCardError => e
       self.stripe_error_code = e.error_code
-      self.stripe_transaction_id = e.charge_id
-      self.was_zipcode_check_performed = true if e.error_code == "incorrect_zip"
-      logger.info "Charge processor error: #{e.message} in purchase: #{external_id}"
+      logger.info "Error while preparing chargeable: #{e.message} in purchase: #{external_id}"
       errors.add :base, PurchaseErrorCode.customer_error_message(e.message)
-      nil
-    rescue ChargeProcessorErrorRateLimit => e
-      logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
-      errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
-      self.error_code = charge_processor_unavailable_error
-      raise e
-    rescue ChargeProcessorErrorGeneric => e
-      logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
-      errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
-      self.stripe_error_code = e.error_code
-      nil
     end
 
-    # Private: Returns true if a custom file receipt should be sent for this
-    # purchase, false otherwise.
-    #
-    # if it's a gift sender purchase, then there's no url_redirect for this
-    # purchase and we should just send a normal receipt without a link.
-    def needs_custom_file_receipt
-      link.customize_file_per_purchase? && !is_gift_sender_purchase
-    end
+    chargeable
+  end
 
-    # Private: Loads the chargeable object that should be used for charging this purchase. This may be the chargeable
-    # object created when an external party created the purchase (self.chargeable) or it may created here
-    # if the purchase is being made on a logged in user's (self.purchaser) credit card or a credit card has been
-    # predefined (e.g. in the preorder flow this happens).
-    # In case the purchase is a subscription it should charge the subscription.credit_card, in case it is present
-    #
-    # If a card parameter error has been give to the purchase, it will be handled here during the loading process since
-    # no card data has been provided and the error is the explanation for why that is the case.
-    #
-    # Returns: The final chargeable that should be used for charging. May be the same object passed in or different.
-    # If there is no chargeable available nil will be returned.
-    def load_chargeable_for_charging
-      if card_data_handling_error.present?
-        logger.error %(Card params error in purchase: #{external_id} -
+  def save_chargeable?
+    (purchaser.present? && save_card && chargeable&.can_be_saved?) ||
+      is_preorder_authorization? ||
+      link.is_recurring_billing? ||
+      link.native_type == Link::NATIVE_TYPE_COMMISSION ||
+      is_installment_payment
+  end
+
+  def charge_processor_unavailable_error
+    if charge_processor_id.blank? || stripe_charge_processor?
+      PurchaseErrorCode::STRIPE_UNAVAILABLE
+    else
+      PurchaseErrorCode::PAYPAL_UNAVAILABLE
+    end
+  end
+
+  def prepare_merchant_account(charge_processor_id)
+    # Note: This assumes for the time being that all chargeables have only one internal chargeable.
+    self.merchant_account = seller.merchant_account(charge_processor_id)
+    self.merchant_account ||= MerchantAccount.gumroad(charge_processor_id)
+    if merchant_account&.is_a_brazilian_stripe_connect_account? && affiliate.present?
+      self.error_code = PurchaseErrorCode::BRAZILIAN_MERCHANT_ACCOUNT_WITH_AFFILIATE
+      errors.add(:base, "Affiliate sales are not currently supported for this product.")
+    end
+    calculate_fees
+  end
+
+  def create_setup_intent(chargeable)
+    with_charge_processor_error_handler do
+      self.setup_intent = ChargeProcessor.setup_future_charges!(self.merchant_account, chargeable,
+                                                                mandate_options: mandate_options_for_stripe(with_currency: true))
+      return unless setup_intent.present?
+
+      self.processor_setup_intent_id = setup_intent.id
+      credit_card.update!(json_data: { stripe_setup_intent_id: setup_intent.id }) if credit_card&.requires_mandate?
+      save!
+
+      unless setup_intent.succeeded? || setup_intent.requires_action?
+        errors.add :base, "Sorry, something went wrong."
+      end
+    end
+  end
+
+  def create_charge_intent(chargeable, off_session: true)
+    with_charge_processor_error_handler do
+      amount_cents = total_transaction_cents
+      amount_for_gumroad_cents = total_transaction_amount_for_gumroad_cents
+      description = "You bought #{link.long_url}!"
+      mandate_options = mandate_options_for_stripe
+
+      charge_intent = ChargeProcessor.create_payment_intent_or_charge!(self.merchant_account,
+                                                                       chargeable,
+                                                                       amount_cents,
+                                                                       amount_for_gumroad_cents,
+                                                                       external_id,
+                                                                       description,
+                                                                       statement_description:,
+                                                                       transfer_group: id,
+                                                                       off_session:,
+                                                                       setup_future_charges:,
+                                                                       mandate_options:)
+
+      if charge_intent.id.present?
+        if processor_payment_intent.present?
+          processor_payment_intent.update!(intent_id: charge_intent.id)
+        else
+          create_processor_payment_intent!(intent_id: charge_intent.id)
+        end
+      end
+      save!
+      credit_card.update!(json_data: { stripe_payment_intent_id: charge_intent.id }) if credit_card&.requires_mandate? && mandate_options.present?
+
+      charge_intent
+    end
+  end
+
+  def with_charge_processor_error_handler
+    yield
+  rescue ChargeProcessorInvalidRequestError, ChargeProcessorUnavailableError => e
+    logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
+    self.error_code = charge_processor_unavailable_error
+    nil
+  rescue ChargeProcessorPayeeAccountRestrictedError => e
+    logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "There is a problem with creator's paypal account, please try again later (your card was not charged)."
+    self.stripe_error_code = PurchaseErrorCode::PAYPAL_MERCHANT_ACCOUNT_RESTRICTED
+    nil
+  rescue ChargeProcessorPayerCancelledBillingAgreementError => e
+    logger.error "Error while creating charge: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "Customer has cancelled the billing agreement on PayPal."
+    self.stripe_error_code = PurchaseErrorCode::PAYPAL_PAYER_CANCELLED_BILLING_AGREEMENT
+    nil
+  rescue ChargeProcessorPaymentDeclinedByPayerAccountError => e
+    logger.error "Error while creating charge: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "Customer PayPal account has declined the payment."
+    self.stripe_error_code = PurchaseErrorCode::PAYPAL_PAYER_ACCOUNT_DECLINED_PAYMENT
+    nil
+  rescue ChargeProcessorUnsupportedPaymentTypeError => e
+    logger.info "Charge processor error: Unsupported paypal payment method selected"
+    errors.add :base, "We weren't able to charge your PayPal account. Please select another method of payment."
+    self.stripe_error_code = e.error_code
+    self.stripe_transaction_id = e.charge_id
+    nil
+  rescue ChargeProcessorUnsupportedPaymentAccountError => e
+    logger.info "Charge processor error: PayPal account used is not supported"
+    errors.add :base, "Your PayPal account cannot be charged. Please select another method of payment."
+    self.stripe_error_code = e.error_code
+    self.stripe_transaction_id = e.charge_id
+    nil
+  rescue ChargeProcessorCardError => e
+    self.stripe_error_code = e.error_code
+    self.stripe_transaction_id = e.charge_id
+    self.was_zipcode_check_performed = true if e.error_code == "incorrect_zip"
+    logger.info "Charge processor error: #{e.message} in purchase: #{external_id}"
+    errors.add :base, PurchaseErrorCode.customer_error_message(e.message)
+    nil
+  rescue ChargeProcessorErrorRateLimit => e
+    logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
+    self.error_code = charge_processor_unavailable_error
+    raise e
+  rescue ChargeProcessorErrorGeneric => e
+    logger.error "Charge processor error: #{e.message} in purchase: #{external_id}"
+    errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
+    self.stripe_error_code = e.error_code
+    nil
+  end
+
+  # Private: Returns true if a custom file receipt should be sent for this
+  # purchase, false otherwise.
+  #
+  # if it's a gift sender purchase, then there's no url_redirect for this
+  # purchase and we should just send a normal receipt without a link.
+  def needs_custom_file_receipt
+    link.customize_file_per_purchase? && !is_gift_sender_purchase
+  end
+
+  # Private: Loads the chargeable object that should be used for charging this purchase. This may be the chargeable
+  # object created when an external party created the purchase (self.chargeable) or it may created here
+  # if the purchase is being made on a logged in user's (self.purchaser) credit card or a credit card has been
+  # predefined (e.g. in the preorder flow this happens).
+  # In case the purchase is a subscription it should charge the subscription.credit_card, in case it is present
+  #
+  # If a card parameter error has been give to the purchase, it will be handled here during the loading process since
+  # no card data has been provided and the error is the explanation for why that is the case.
+  #
+  # Returns: The final chargeable that should be used for charging. May be the same object passed in or different.
+  # If there is no chargeable available nil will be returned.
+  def load_chargeable_for_charging
+    if card_data_handling_error.present?
+      logger.error %(Card params error in purchase: #{external_id} -
                        #{card_data_handling_error.error_message} #{card_data_handling_error.card_error_code})
-        if card_data_handling_error.is_card_error?
-          self.stripe_error_code = card_data_handling_error.card_error_code
-          errors.add :base, PurchaseErrorCode.customer_error_message(card_data_handling_error.error_message)
-        else
-          self.error_code = charge_processor_unavailable_error
-          errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
-        end
-        return nil
-      end
-
-      if chargeable.present?
-        prepare_merchant_account(chargeable.charge_processor_id)
-        return chargeable
-      elsif subscription.present? && subscription.credit_card.present?
-        self.credit_card = subscription.credit_card
-      elsif purchaser_card_supported?
-        self.credit_card = purchaser.credit_card
-      end
-
-      if credit_card.present?
-        # set the card data handling mode to nothing since we're not handling card data if we're using a pre-existing saved card
-        self.card_data_handling_mode = nil
-        self.charge_processor_id ||= credit_card.charge_processor_id
-        prepare_merchant_account(credit_card.charge_processor_id)
-        return credit_card.to_chargeable(merchant_account:)
-      end
-
-      logger.error "No credit card information provided in purchase: #{external_id}."
-      self.error_code = PurchaseErrorCode::CREDIT_CARD_NOT_PROVIDED
-      errors.add :base, PurchaseErrorCode.customer_error_message
-      nil
-    end
-
-    def validate_chargeable_for_charging(chargeable)
-      raise "A chargeable backed by multiple charge processors was provided in purchase: #{external_id}." if chargeable.charge_processor_ids.length != 1
-    end
-
-    def price_not_too_high
-      max_product_price = link.user.max_product_price
-      return if self.price_cents.nil? || max_product_price.nil?
-      return if self.price_cents <= max_product_price
-
-      self.error_code = PurchaseErrorCode::PRICE_TOO_HIGH
-      errors.add(:base, "Sorry, we limit purchases to $5,000 at the moment.")
-    end
-
-    def price_not_too_low
-      return if errors.present?
-      return if is_bundle_product_purchase?
-
-      min_price = link.currency["min_price"]
-      formatted_min_price = formatted_price(link.price_currency_type, min_price)
-
-      # normal purchases of customizable_price products cannot be less than minimum for currency, unless they're 0.
-      if customizable_price? && displayed_price_cents < min_price && self.price_cents != 0
-        self.error_code = PurchaseErrorCode::CONTRIBUTION_TOO_LOW
-        errors.add(:base, "The amount must be at least #{formatted_min_price}.")
-        return
-      end
-
-      return if displayed_price_cents >= minimum_paid_price_cents
-
-      self.error_code = PurchaseErrorCode::PRICE_CENTS_TOO_LOW
-      errors.add(:base, "Please enter an amount greater than or equal to the minimum.")
-    end
-
-    # Private: validator that guarantees that the right transaction information is present for paid purchases.
-    def financial_transaction_validation
-      return if self.price_cents > 0 &&
-                stripe_transaction_id.present? &&
-                merchant_account.present? &&
-                (stripe_fingerprint.present? || paypal_order_id) &&
-                charge_processor_id.present?
-
-      return if (self.price_cents == 0 || self.price_cents.nil?) &&
-                stripe_transaction_id.blank? &&
-                stripe_fingerprint.blank? &&
-                charge_processor_id.nil? &&
-                self.merchant_account.nil?
-
-      errors.add(:base, "We couldn't charge your card. Try again or use a different card.")
-    end
-
-    def zip_code_from_geoip
-      self.zip_code ||= geo_info.try(:postal_code)
-    end
-
-    def create_sales_tax_info!
-      return if purchase_sales_tax_info
-
-      purchase_sales_tax_info = PurchaseSalesTaxInfo.new
-      purchase_sales_tax_info.ip_address = ip_address
-      purchase_sales_tax_info.postal_code = zip_code
-      purchase_sales_tax_info.state_code = state
-
-      purchase_sales_tax_info.country_code = Compliance::Countries.find_by_name(country)&.alpha2
-      purchase_sales_tax_info.ip_country_code = Compliance::Countries.find_by_name(ip_country)&.alpha2
-      purchase_sales_tax_info.elected_country_code = sales_tax_country_code_election
-
-      if business_vat_id
-        if Compliance::Countries::AUS.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if AbnValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::SGP.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if GstValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::CAN.alpha2 == purchase_sales_tax_info.country_code &&
-              QUEBEC == purchase_sales_tax_info.state_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if QstValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::NOR.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if MvaValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::BHR.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if TrnValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::KEN.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if KraPinValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::OMN.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if OmanVatNumberValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::NGA.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if FirsTinValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::TZA.alpha2 == purchase_sales_tax_info.country_code
-          purchase_sales_tax_info.business_vat_id = business_vat_id if TraTinValidationService.new(business_vat_id).process
-        elsif Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS.include?(purchase_sales_tax_info.country_code) ||
-              Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS_WITH_TAX_ID_PRO_VALIDATION.include?(purchase_sales_tax_info.country_code)
-          purchase_sales_tax_info.business_vat_id = business_vat_id if TaxIdValidationService.new(business_vat_id, purchase_sales_tax_info.country_code).process
-        else
-          purchase_sales_tax_info.business_vat_id = business_vat_id if VatValidationService.new(business_vat_id).process
-        end
-      end
-
-      self.purchase_sales_tax_info = purchase_sales_tax_info
-      self.purchase_sales_tax_info.save!
-    end
-
-    def charge_discover_fee?
-      return false unless link.recommendable? || (not_is_original_subscription_purchase? && original_purchase&.was_discover_fee_charged?)
-      was_product_recommended? && !RecommendationType.is_free_recommendation_type?(recommended_by)
-    end
-
-    # Calculates the fees we charge based on price_cents
-    #
-    # This is called multiple times from process!.
-    # This function should only set fee_cents and not change any other state.
-    def calculate_fees
-      return unless self.price_cents
-
-      if price_cents == 0 || merchant_account&.is_a_brazilian_stripe_connect_account?
-        self.fee_cents = 0
-        return
-      end
-
-      fee_per_thousand = calculate_gumroad_fee_per_thousand
-
-      if charge_discover_fee?
-        discover_fee_per_thousand = calculate_additional_discover_fee_per_thousand
-        if discover_fee_per_thousand > 0
-          fee_per_thousand += discover_fee_per_thousand
-          self.was_discover_fee_charged = true
-        end
-      end
-
-      variable_fee_cents = (price_cents * fee_per_thousand / 1000.0).round
-
-      fixed_processor_fee_cents = charged_using_gumroad_merchant_account? ? PROCESSOR_FIXED_FEE_CENTS : 0
-      fixed_fee_cents = if is_recurring_subscription_charge
-        if subscription.mor_fee_applicable?
-          was_discover_fee_charged? ? 0 : GUMROAD_FIXED_FEE_CENTS + fixed_processor_fee_cents
-        else
-          fixed_processor_fee_cents
-        end
+      if card_data_handling_error.is_card_error?
+        self.stripe_error_code = card_data_handling_error.card_error_code
+        errors.add :base, PurchaseErrorCode.customer_error_message(card_data_handling_error.error_message)
       else
+        self.error_code = charge_processor_unavailable_error
+        errors.add :base, "There is a temporary problem, please try again (your card was not charged)."
+      end
+      return nil
+    end
+
+    if chargeable.present?
+      prepare_merchant_account(chargeable.charge_processor_id)
+      return chargeable
+    elsif subscription.present? && subscription.credit_card.present?
+      self.credit_card = subscription.credit_card
+    elsif purchaser_card_supported?
+      self.credit_card = purchaser.credit_card
+    end
+
+    if credit_card.present?
+      # set the card data handling mode to nothing since we're not handling card data if we're using a pre-existing saved card
+      self.card_data_handling_mode = nil
+      self.charge_processor_id ||= credit_card.charge_processor_id
+      prepare_merchant_account(credit_card.charge_processor_id)
+      return credit_card.to_chargeable(merchant_account:)
+    end
+
+    logger.error "No credit card information provided in purchase: #{external_id}."
+    self.error_code = PurchaseErrorCode::CREDIT_CARD_NOT_PROVIDED
+    errors.add :base, PurchaseErrorCode.customer_error_message
+    nil
+  end
+
+  def validate_chargeable_for_charging(chargeable)
+    raise "A chargeable backed by multiple charge processors was provided in purchase: #{external_id}." if chargeable.charge_processor_ids.length != 1
+  end
+
+  def price_not_too_high
+    max_product_price = link.user.max_product_price
+    return if self.price_cents.nil? || max_product_price.nil?
+    return if self.price_cents <= max_product_price
+
+    self.error_code = PurchaseErrorCode::PRICE_TOO_HIGH
+    errors.add(:base, "Sorry, we limit purchases to $5,000 at the moment.")
+  end
+
+  def price_not_too_low
+    return if errors.present?
+    return if is_bundle_product_purchase?
+
+    min_price = link.currency["min_price"]
+    formatted_min_price = formatted_price(link.price_currency_type, min_price)
+
+    # normal purchases of customizable_price products cannot be less than minimum for currency, unless they're 0.
+    if customizable_price? && displayed_price_cents < min_price && self.price_cents != 0
+      self.error_code = PurchaseErrorCode::CONTRIBUTION_TOO_LOW
+      errors.add(:base, "The amount must be at least #{formatted_min_price}.")
+      return
+    end
+
+    return if displayed_price_cents >= minimum_paid_price_cents
+
+    self.error_code = PurchaseErrorCode::PRICE_CENTS_TOO_LOW
+    errors.add(:base, "Please enter an amount greater than or equal to the minimum.")
+  end
+
+  # Private: validator that guarantees that the right transaction information is present for paid purchases.
+  def financial_transaction_validation
+    return if self.price_cents > 0 &&
+              stripe_transaction_id.present? &&
+              merchant_account.present? &&
+              (stripe_fingerprint.present? || paypal_order_id) &&
+              charge_processor_id.present?
+
+    return if (self.price_cents == 0 || self.price_cents.nil?) &&
+              stripe_transaction_id.blank? &&
+              stripe_fingerprint.blank? &&
+              charge_processor_id.nil? &&
+              self.merchant_account.nil?
+
+    errors.add(:base, "We couldn't charge your card. Try again or use a different card.")
+  end
+
+  def zip_code_from_geoip
+    self.zip_code ||= geo_info.try(:postal_code)
+  end
+
+  def create_sales_tax_info!
+    return if purchase_sales_tax_info
+
+    purchase_sales_tax_info = PurchaseSalesTaxInfo.new
+    purchase_sales_tax_info.ip_address = ip_address
+    purchase_sales_tax_info.postal_code = zip_code
+    purchase_sales_tax_info.state_code = state
+
+    purchase_sales_tax_info.country_code = Compliance::Countries.find_by_name(country)&.alpha2
+    purchase_sales_tax_info.ip_country_code = Compliance::Countries.find_by_name(ip_country)&.alpha2
+    purchase_sales_tax_info.elected_country_code = sales_tax_country_code_election
+
+    if business_vat_id
+      if Compliance::Countries::AUS.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if AbnValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::SGP.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if GstValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::CAN.alpha2 == purchase_sales_tax_info.country_code &&
+            QUEBEC == purchase_sales_tax_info.state_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if QstValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::NOR.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if MvaValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::BHR.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if TrnValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::KEN.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if KraPinValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::OMN.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if OmanVatNumberValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::NGA.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if FirsTinValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::TZA.alpha2 == purchase_sales_tax_info.country_code
+        purchase_sales_tax_info.business_vat_id = business_vat_id if TraTinValidationService.new(business_vat_id).process
+      elsif Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS.include?(purchase_sales_tax_info.country_code) ||
+            Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS_WITH_TAX_ID_PRO_VALIDATION.include?(purchase_sales_tax_info.country_code)
+        purchase_sales_tax_info.business_vat_id = business_vat_id if TaxIdValidationService.new(business_vat_id, purchase_sales_tax_info.country_code).process
+      else
+        purchase_sales_tax_info.business_vat_id = business_vat_id if VatValidationService.new(business_vat_id).process
+      end
+    end
+
+    self.purchase_sales_tax_info = purchase_sales_tax_info
+    self.purchase_sales_tax_info.save!
+  end
+
+  def charge_discover_fee?
+    return false unless link.recommendable? || (not_is_original_subscription_purchase? && original_purchase&.was_discover_fee_charged?)
+    was_product_recommended? && !RecommendationType.is_free_recommendation_type?(recommended_by)
+  end
+
+  # Calculates the fees we charge based on price_cents
+  #
+  # This is called multiple times from process!.
+  # This function should only set fee_cents and not change any other state.
+  def calculate_fees
+    return unless self.price_cents
+
+    if price_cents == 0 || merchant_account&.is_a_brazilian_stripe_connect_account?
+      self.fee_cents = 0
+      return
+    end
+
+    fee_per_thousand = calculate_gumroad_fee_per_thousand
+
+    if charge_discover_fee?
+      discover_fee_per_thousand = calculate_additional_discover_fee_per_thousand
+      if discover_fee_per_thousand > 0
+        fee_per_thousand += discover_fee_per_thousand
+        self.was_discover_fee_charged = true
+      end
+    end
+
+    variable_fee_cents = (price_cents * fee_per_thousand / 1000.0).round
+
+    fixed_processor_fee_cents = charged_using_gumroad_merchant_account? ? PROCESSOR_FIXED_FEE_CENTS : 0
+    fixed_fee_cents = if is_recurring_subscription_charge
+      if subscription.mor_fee_applicable?
         was_discover_fee_charged? ? 0 : GUMROAD_FIXED_FEE_CENTS + fixed_processor_fee_cents
+      else
+        fixed_processor_fee_cents
       end
-
-      self.fee_cents = variable_fee_cents + fixed_fee_cents
-      self.affiliate_credit_cents = determine_affiliate_balance_cents
+    else
+      was_discover_fee_charged? ? 0 : GUMROAD_FIXED_FEE_CENTS + fixed_processor_fee_cents
     end
 
-    def calculate_additional_discover_fee_per_thousand
-      if is_recurring_subscription_charge || is_updated_original_subscription_purchase
-        subscription.original_purchase.discover_fee_per_thousand - (flat_fee_applicable? ? (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) : 0) - (subscription.mor_fee_applicable? && charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
-      elsif is_preorder_charge?
-        preorder.authorization_purchase.discover_fee_per_thousand - (flat_fee_applicable? ? (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) + PROCESSOR_FEE_PER_THOUSAND : 0)
+    self.fee_cents = variable_fee_cents + fixed_fee_cents
+    self.affiliate_credit_cents = determine_affiliate_balance_cents
+  end
+
+  def calculate_additional_discover_fee_per_thousand
+    if is_recurring_subscription_charge || is_updated_original_subscription_purchase
+      subscription.original_purchase.discover_fee_per_thousand - (flat_fee_applicable? ? (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) : 0) - (subscription.mor_fee_applicable? && charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
+    elsif is_preorder_charge?
+      preorder.authorization_purchase.discover_fee_per_thousand - (flat_fee_applicable? ? (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) + PROCESSOR_FEE_PER_THOUSAND : 0)
+    else
+      GUMROAD_DISCOVER_FEE_PER_THOUSAND - (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) - (charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
+    end
+  end
+
+  def calculate_gumroad_fee_per_thousand
+    if flat_fee_applicable?
+      calculate_custom_fee_per_thousand
+      (custom_fee_per_thousand.presence || gumroad_flat_fee_per_thousand) + (charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
+    elsif seller.tier_pricing_enabled?
+      (seller.tier_fee(is_merchant_account: charged_using_gumroad_merchant_account?).to_f * 1000).round
+    else
+      if charged_using_gumroad_merchant_account?
+        gumroad_fee_percentage_for_non_migrated_account
       else
-        GUMROAD_DISCOVER_FEE_PER_THOUSAND - (custom_fee_per_thousand.presence || GUMROAD_DISCOVER_EXTRA_FEE_PER_THOUSAND) - (charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
+        gumroad_fee_percentage_for_migrated_account
       end
     end
+  end
 
-    def calculate_gumroad_fee_per_thousand
-      if flat_fee_applicable?
-        calculate_custom_fee_per_thousand
-        (custom_fee_per_thousand.presence || gumroad_flat_fee_per_thousand) + (charged_using_gumroad_merchant_account? ? PROCESSOR_FEE_PER_THOUSAND : 0)
-      elsif seller.tier_pricing_enabled?
-        (seller.tier_fee(is_merchant_account: charged_using_gumroad_merchant_account?).to_f * 1000).round
+  def calculate_custom_fee_per_thousand
+    return if custom_fee_per_thousand.present?
+    return if charge_discover_fee?
+
+    if is_recurring_subscription_charge || is_updated_original_subscription_purchase
+      self.custom_fee_per_thousand = subscription.original_purchase.custom_fee_per_thousand if subscription.original_purchase.custom_fee_per_thousand.present?
+    elsif is_preorder_charge?
+      self.custom_fee_per_thousand = preorder.authorization_purchase.custom_fee_per_thousand if preorder.authorization_purchase.custom_fee_per_thousand.present?
+    elsif seller.custom_fee_per_thousand.present?
+      self.custom_fee_per_thousand = seller.custom_fee_per_thousand
+    end
+  end
+
+  def gumroad_flat_fee_per_thousand
+    seller.waive_gumroad_fee_on_new_sales? && subscription.blank? && !is_preorder_charge? ? 0 : GUMROAD_FLAT_FEE_PER_THOUSAND
+  end
+
+  def flat_fee_applicable?
+    # 10% flat fee is applicable to this purchase if it is not a recurring charge
+    # on a subscription that started before the flat fee was introduced.
+    subscription.blank? || subscription.flat_fee_applicable?
+  end
+
+  def gumroad_fee_percentage_for_non_migrated_account
+    GUMROAD_FEE_PER_THOUSAND
+  end
+
+  def gumroad_fee_percentage_for_migrated_account
+    GUMROAD_NON_PRO_FEE_PERCENTAGE
+  end
+
+  def calculate_taxes
+    return unless self.price_cents
+    return if price_cents == 0
+    return unless tax_location_valid?
+    return if seller.has_brazilian_stripe_connect_account?
+
+    customer_country = country_or_ip_country
+    country_code = Compliance::Countries.find_by_name(customer_country)&.alpha2
+
+    in_eu_country = Compliance::Countries::EU_VAT_APPLICABLE_COUNTRY_CODES.include?(country_code)
+    in_australia = customer_country == Compliance::Countries::AUS.common_name
+    in_singapore = customer_country == Compliance::Countries::SGP.common_name
+    in_norway = customer_country == Compliance::Countries::NOR.common_name
+    in_other_taxable_country = (Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS).include?(country_code)
+    in_other_taxable_country ||= (Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS).include?(country_code) && !link.is_physical?
+    # Will return zip from shipping information if available before guessing from IP.
+    # Shipping info is saved in Purchase during its creation the in the Purchases controller
+    # See best_guess_zip for more detail on parsing / guessing zip
+    postal_code = best_guess_zip
+
+    calculator = SalesTaxCalculator.new(product: link,
+                                        price_cents:,
+                                        shipping_cents: shipping_cents.to_i,
+                                        quantity:,
+                                        buyer_location: { postal_code:, country: country_code, state:, ip_address: },
+                                        buyer_vat_id: business_vat_id,
+                                        from_discover: was_product_recommended)
+
+    return unless in_eu_country || in_australia || in_singapore || in_norway || (in_other_taxable_country && Feature.active?("collect_tax_#{country_code.downcase}")) || calculator.is_us_taxable_state || calculator.is_ca_taxable
+
+    tax_calculation = calculator.calculate
+
+    if tax_calculation.zip_tax_rate.present?
+      self.zip_tax_rate = tax_calculation.zip_tax_rate
+
+      if tax_calculation.zip_tax_rate.is_seller_responsible
+        self.tax_cents = tax_calculation.tax_cents
       else
-        if charged_using_gumroad_merchant_account?
-          gumroad_fee_percentage_for_non_migrated_account
-        else
-          gumroad_fee_percentage_for_migrated_account
+        self.gumroad_tax_cents = tax_calculation.tax_cents
+      end
+    elsif tax_calculation.used_taxjar
+
+      if tax_calculation.gumroad_is_mpf
+        self.gumroad_tax_cents = tax_calculation.tax_cents
+      else
+        self.tax_cents = tax_calculation.tax_cents
+      end
+
+      if tax_calculation.taxjar_info.present?
+        (purchase_taxjar_info || build_purchase_taxjar_info).tap do |info|
+          info.combined_tax_rate = tax_calculation.taxjar_info[:combined_tax_rate]
+          info.state_tax_rate = tax_calculation.taxjar_info[:state_tax_rate]
+          info.county_tax_rate = tax_calculation.taxjar_info[:county_tax_rate]
+          info.city_tax_rate = tax_calculation.taxjar_info[:city_tax_rate]
+          info.gst_tax_rate = tax_calculation.taxjar_info[:gst_tax_rate]
+          info.pst_tax_rate = tax_calculation.taxjar_info[:pst_tax_rate]
+          info.qst_tax_rate = tax_calculation.taxjar_info[:qst_tax_rate]
+          info.jurisdiction_state = tax_calculation.taxjar_info[:jurisdiction_state]
+          info.jurisdiction_county = tax_calculation.taxjar_info[:jurisdiction_county]
+          info.jurisdiction_city = tax_calculation.taxjar_info[:jurisdiction_city]
+          info.save!
         end
       end
     end
 
-    def calculate_custom_fee_per_thousand
-      return if custom_fee_per_thousand.present?
-      return if charge_discover_fee?
+    self.was_purchase_taxable = gumroad_tax_cents > 0 || tax_cents > 0
+    self.was_tax_excluded_from_price = true
+  end
 
-      if is_recurring_subscription_charge || is_updated_original_subscription_purchase
-        self.custom_fee_per_thousand = subscription.original_purchase.custom_fee_per_thousand if subscription.original_purchase.custom_fee_per_thousand.present?
-      elsif is_preorder_charge?
-        self.custom_fee_per_thousand = preorder.authorization_purchase.custom_fee_per_thousand if preorder.authorization_purchase.custom_fee_per_thousand.present?
-      elsif seller.custom_fee_per_thousand.present?
-        self.custom_fee_per_thousand = seller.custom_fee_per_thousand
+  def calculate_shipping
+    return unless link.is_physical
+    return if country.blank?
+
+    self.shipping_cents = if is_recurring_subscription_charge
+      subscription.original_purchase.shipping_cents
+    elsif is_preorder_charge?
+      preorder.authorization_purchase.shipping_cents
+    else
+      shipping_rate = ShippingDestination.for_product_and_country_code(product: link, country_code: Compliance::Countries.find_by_name(country)&.alpha2)
+      shipping_rate.calculate_shipping_rate(quantity:, currency_type: link.price_currency_type)
+    end
+  end
+
+  def validate_shipping
+    return unless link.is_physical
+    return if country.blank?
+
+    if Compliance::Countries.blocked?(Compliance::Countries.find_by_name(country)&.alpha2)
+      self.error_code = PurchaseErrorCode::BLOCKED_SHIPPING_COUNTRY
+      errors.add :base, "The creator cannot ship the product to the country you have selected."
+    elsif ShippingDestination.for_product_and_country_code(product: link, country_code: Compliance::Countries.find_by_name(country)&.alpha2).nil?
+      self.error_code = PurchaseErrorCode::NO_SHIPPING_COUNTRY_CONFIGURED
+      errors.add :base, "The creator cannot ship the product to the country you have selected."
+    end
+  end
+
+  def validate_quantity
+    return if quantity > 0
+
+    self.error_code = PurchaseErrorCode::INVALID_QUANTITY
+    errors.add :base, "Sorry, you've selected an invalid quantity."
+  end
+
+  def validate_offer_code
+    return if errors.present?
+    # accept the offer code that was used when the buyer preordered/subscribed
+    return if is_preorder_charge? || is_recurring_subscription_charge || is_gift_receiver_purchase
+    return if discount_code.blank?
+
+    if offer_code.nil?
+      self.error_code = PurchaseErrorCode::OFFER_CODE_INVALID
+      errors.add :base, "Sorry, the discount code you wish to use is invalid."
+      return
+    end
+
+    if offer_code.inactive?
+      self.error_code = PurchaseErrorCode::OFFER_CODE_INACTIVE
+      errors.add :base, "Sorry, the discount code you wish to use is inactive."
+      return
+    end
+
+    unless quantity >= (offer_code.minimum_quantity || 0)
+      self.error_code = PurchaseErrorCode::OFFER_CODE_INSUFFICIENT_QUANTITY
+      errors.add :base, "Sorry, the discount code you wish to use has an unmet minimum quantity."
+      return
+    end
+
+    return if offer_code.is_valid_for_purchase?(purchase_quantity: quantity)
+
+    if offer_code.quantity_left > 0
+      self.error_code = PurchaseErrorCode::EXCEEDING_OFFER_CODE_QUANTITY
+      errors.add :base, "Sorry, the discount code you are using is invalid for the quantity you have selected."
+    else
+      self.error_code = PurchaseErrorCode::OFFER_CODE_SOLD_OUT
+      errors.add :base, "Sorry, the discount code you wish to use has expired."
+    end
+
+    true
+  end
+
+  def validate_subscription
+    return unless is_recurring_subscription_charge
+    return if subscription.alive?
+
+    self.error_code = PurchaseErrorCode::SUBSCRIPTION_INACTIVE
+    errors.add :base, "This subscription has been canceled."
+  end
+
+  def perceived_price_cents_matches_price_cents
+    return if errors.present?
+    return if perceived_price_cents.nil?
+    return if is_upgrade_purchase?
+    return if is_commission_completion_purchase?
+    return if is_applying_plan_change
+    return if perceived_price_equals_link_price?
+    return if customizable_price_that_has_not_changed?
+
+    self.error_code = PurchaseErrorCode::PERCEIVED_PRICE_CENTS_NOT_MATCHING
+    errors.add(:price_cents, "The price just changed! Refresh the page for the updated price.")
+    true
+  end
+
+  def determine_customized_price_cents
+    customizable_price? ? perceived_price_cents : nil
+  end
+
+  def calculate_price_range_cents
+    return unless price_range
+
+    clean = price_range.to_s
+
+    unless link.single_unit_currency?
+      clean = clean.gsub(/[^-0-9.,]/, "") # allow commas for now
+      if clean.rindex(/,/).present? && clean.rindex(/,/) >= clean.length - 3 # euro style!
+        clean = clean.delete(".") # remove euro 1000^x delimiters
+        clean = clean.tr(",", ".")             # replace euro comma with decimal
+      end
+    end
+    clean = clean.gsub(/[^-0-9.]/, "")         # remove commas
+
+    string_to_price_cents(link.price_currency_type.to_sym, clean)
+  end
+
+  def perceived_price_equals_link_price?
+    [minimum_paid_price_cents, minimum_paid_price_cents - 1].include?(perceived_price_cents.to_i)
+  end
+
+  def customizable_price_that_has_not_changed?
+    customizable_price? && perceived_price_cents.to_i >= minimum_paid_price_cents
+  end
+
+  def sold_out
+    # Allow recurring billing and pre-order charges even after the product is sold out.
+    return if does_not_count_towards_max_purchases
+    return if link.max_purchase_count.nil?
+    return if (link.sales_count_for_inventory + quantity) <= link.max_purchase_count
+
+    if link.sales_count_for_inventory == link.max_purchase_count
+      self.error_code = PurchaseErrorCode::PRODUCT_SOLD_OUT
+      errors.add :base, "Sold out, please go back and pick another option."
+    else
+      self.error_code = PurchaseErrorCode::EXCEEDING_PRODUCT_QUANTITY
+      errors.add :base, "You have chosen a quantity that exceeds what is available."
+    end
+  end
+
+  def variants_available
+    return if does_not_count_towards_max_purchases
+    return if link.variant_categories_alive.empty?
+    new_variants_available = new_variants.empty? || new_variants.map(&:available?).reduce { |a, e| a && e }
+
+    return if new_variants_available && variants_available_for_quantity?
+
+    if !new_variants_available
+      self.error_code = PurchaseErrorCode::VARIANT_SOLD_OUT
+      errors.add :base, "Sold out, please go back and pick another option."
+    else
+      self.error_code = PurchaseErrorCode::EXCEEDING_VARIANT_QUANTITY
+      errors.add :base, "You have chosen a quantity that exceeds what is available."
+    end
+  end
+
+  def variants_available_for_quantity?
+    new_variants.map(&:quantity_left).each do |quantity_left|
+      return false if quantity_left && quantity_left < quantity
+    end
+
+    true
+  end
+
+  def new_variants
+    original_variant_attributes.present? ? variant_attributes - original_variant_attributes : variant_attributes
+  end
+
+  def variants_satisfied
+    return if is_preorder_charge?
+    return if is_commission_completion_purchase?
+    return if is_recurring_subscription_charge
+    return if link.native_type == Link::NATIVE_TYPE_COFFEE
+
+    if link.skus_enabled
+      return if variant_attributes.length == 1 && link.skus.alive.where(id: variant_attributes.first.id).exists?
+      return if variant_attributes.empty? && link.skus.alive.empty?
+    else
+      return if (link.variant_categories_alive.map(&:id) & variant_attributes.map(&:variant_category_id)).count == link.variant_categories_alive.count
+    end
+
+    self.error_code = PurchaseErrorCode::MISSING_VARIANTS
+    errors.add :base, "The product's variants have changed, please refresh the page!"
+  end
+
+  def product_is_sellable
+    return if is_recurring_subscription_charge || is_preorder_charge? || is_test_purchase? || is_updated_original_subscription_purchase || is_commission_completion_purchase
+    return unless seller.suspended? || !link.alive?
+
+    self.error_code = PurchaseErrorCode::NOT_FOR_SALE
+    errors.add :base, "This product is not currently for sale."
+  end
+
+  def product_is_not_blocked
+    return if price_cents.zero?
+    return if Feature.inactive?(:block_purchases_on_product)
+    return if BlockedObject.product.find_active_object(link_id).blank?
+
+    self.error_code = PurchaseErrorCode::TEMPORARILY_BLOCKED_PRODUCT
+    errors.add :base, "Your card was not charged."
+  end
+
+  def validate_purchase_type
+    if is_rental && link.buy_only?
+      self.error_code = PurchaseErrorCode::NOT_FOR_RENT
+      errors.add :base, "This product cannot be rented."
+    elsif !is_rental && link.rent_only?
+      self.error_code = PurchaseErrorCode::ONLY_FOR_RENT
+      errors.add :base, "This product can only be rented."
+    end
+  end
+
+  def not_double_charged
+    return if is_bundle_product_purchase
+    return if is_automatic_charge
+    return if is_gift_receiver_purchase
+    return if is_updated_original_subscription_purchase
+    return if is_commission_completion_purchase
+    return if link.allow_double_charges
+
+    cancel_parallel_charge_intents
+
+    limiting_purchase_states = [
+      is_preorder_authorization ? "preorder_authorization_successful" : "successful",
+      "in_progress"
+    ]
+
+    last_allowed_purchase_at = if is_upgrade_purchase? || link.quantity_enabled || link.is_physical || link.is_licensed
+      10.seconds.ago
+    else
+      3.minutes.ago
+    end
+
+    recipient_email = is_gift_sender_purchase ? giftee_email : email
+    already = self.class.where(
+      email: recipient_email,
+      ip_address:,
+      link_id: link.id,
+      purchase_state: limiting_purchase_states
+    ).where("purchases.created_at > ?", last_allowed_purchase_at)
+
+    already = already.where("purchases.id != ?", id) if id
+    already = already.not_is_gift_sender_purchase unless is_gift_sender_purchase
+
+    already += self.class.joins(:gift_given).where(
+      gifts: { giftee_email: recipient_email },
+      link:,
+      purchase_state: limiting_purchase_states
+    ) unless is_recurring_subscription_charge
+
+    if variant_attributes.present?
+      already = already.select do |purchase|
+        purchase.variant_attributes.sort == variant_attributes.sort
       end
     end
 
-    def gumroad_flat_fee_per_thousand
-      seller.waive_gumroad_fee_on_new_sales? && subscription.blank? && !is_preorder_charge? ? 0 : GUMROAD_FLAT_FEE_PER_THOUSAND
+    add_errors_for_existing_purchase(already)
+  end
+
+  def cancel_parallel_charge_intents
+    potential_duplicates = self.class.where(
+      browser_guid:,
+      link_id: link.id,
+      purchase_state: "in_progress"
+    ).where.not(processor_payment_intent_id: nil)
+     .where("created_at > ?", 1.hour.ago)
+
+    potential_duplicates.each(&:cancel_charge_intent)
+  end
+
+  def add_errors_for_existing_purchase(purchases)
+    if purchases.any?(&:successful?)
+      errors.add :base, "You have already paid for this product. It has been emailed to you."
+    elsif purchases.any?(&:preorder_authorization_successful?)
+      errors.add :base, "You have already pre-ordered this product. A confirmation has been emailed to you."
+    elsif purchases.any?(&:in_progress?)
+      errors.add :base, "You have already attempted to purchase this product. We will email you shortly if the purchase is successful."
+    end
+  end
+
+  def must_have_valid_email
+    return if email && !email_changed?
+
+    errors.add(:base, "valid email required") unless EmailFormatValidator.valid?(email)
+  end
+
+  def seller_is_link_user
+    errors.add(:base, "link does not belong to user") unless seller == link.user
+  end
+
+  def free_trial_purchase_set_correctly
+    return if !is_free_trial_purchase? && !link.free_trial_enabled?
+    return if gift.present?
+
+    if is_free_trial_purchase? && !link.free_trial_enabled? && !is_updated_original_subscription_purchase
+      errors.add(:base, "free trial must be enabled on the product")
+      return
     end
 
-    def flat_fee_applicable?
-      # 10% flat fee is applicable to this purchase if it is not a recurring charge
-      # on a subscription that started before the flat fee was introduced.
-      subscription.blank? || subscription.flat_fee_applicable?
+    if is_free_trial_purchase? && is_recurring_subscription_charge
+      errors.add(:base, "recurring charges should not be marked as free trial purchases")
+      return
     end
 
-    def gumroad_fee_percentage_for_non_migrated_account
-      GUMROAD_FEE_PER_THOUSAND
-    end
+    if is_original_subscription_purchase? && !is_updated_original_subscription_purchase
+      previous_purchases = link.sales.all_success_states.where(email:).where.not(subscription_id:)
+      already_purchased = previous_purchases.exists?
 
-    def gumroad_fee_percentage_for_migrated_account
-      GUMROAD_NON_PRO_FEE_PERCENTAGE
-    end
-
-    def calculate_taxes
-      return unless self.price_cents
-      return if price_cents == 0
-      return unless tax_location_valid?
-      return if seller.has_brazilian_stripe_connect_account?
-
-      customer_country = country_or_ip_country
-      country_code = Compliance::Countries.find_by_name(customer_country)&.alpha2
-
-      in_eu_country = Compliance::Countries::EU_VAT_APPLICABLE_COUNTRY_CODES.include?(country_code)
-      in_australia = customer_country == Compliance::Countries::AUS.common_name
-      in_singapore = customer_country == Compliance::Countries::SGP.common_name
-      in_norway = customer_country == Compliance::Countries::NOR.common_name
-      in_other_taxable_country = (Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS).include?(country_code)
-      in_other_taxable_country ||= (Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS).include?(country_code) && !link.is_physical?
-      # Will return zip from shipping information if available before guessing from IP.
-      # Shipping info is saved in Purchase during its creation the in the Purchases controller
-      # See best_guess_zip for more detail on parsing / guessing zip
-      postal_code = best_guess_zip
-
-      calculator = SalesTaxCalculator.new(product: link,
-                                          price_cents:,
-                                          shipping_cents: shipping_cents.to_i,
-                                          quantity:,
-                                          buyer_location: { postal_code:, country: country_code, state:, ip_address: },
-                                          buyer_vat_id: business_vat_id,
-                                          from_discover: was_product_recommended)
-
-      return unless in_eu_country || in_australia || in_singapore || in_norway || (in_other_taxable_country && Feature.active?("collect_tax_#{country_code.downcase}")) || calculator.is_us_taxable_state || calculator.is_ca_taxable
-
-      tax_calculation = calculator.calculate
-
-      if tax_calculation.zip_tax_rate.present?
-        self.zip_tax_rate = tax_calculation.zip_tax_rate
-
-        if tax_calculation.zip_tax_rate.is_seller_responsible
-          self.tax_cents = tax_calculation.tax_cents
-        else
-          self.gumroad_tax_cents = tax_calculation.tax_cents
-        end
-      elsif tax_calculation.used_taxjar
-
-        if tax_calculation.gumroad_is_mpf
-          self.gumroad_tax_cents = tax_calculation.tax_cents
-        else
-          self.tax_cents = tax_calculation.tax_cents
-        end
-
-        if tax_calculation.taxjar_info.present?
-          (purchase_taxjar_info || build_purchase_taxjar_info).tap do |info|
-            info.combined_tax_rate = tax_calculation.taxjar_info[:combined_tax_rate]
-            info.state_tax_rate = tax_calculation.taxjar_info[:state_tax_rate]
-            info.county_tax_rate = tax_calculation.taxjar_info[:county_tax_rate]
-            info.city_tax_rate = tax_calculation.taxjar_info[:city_tax_rate]
-            info.gst_tax_rate = tax_calculation.taxjar_info[:gst_tax_rate]
-            info.pst_tax_rate = tax_calculation.taxjar_info[:pst_tax_rate]
-            info.qst_tax_rate = tax_calculation.taxjar_info[:qst_tax_rate]
-            info.jurisdiction_state = tax_calculation.taxjar_info[:jurisdiction_state]
-            info.jurisdiction_county = tax_calculation.taxjar_info[:jurisdiction_county]
-            info.jurisdiction_city = tax_calculation.taxjar_info[:jurisdiction_city]
-            info.save!
-          end
-        end
-      end
-
-      self.was_purchase_taxable = gumroad_tax_cents > 0 || tax_cents > 0
-      self.was_tax_excluded_from_price = true
-    end
-
-    def calculate_shipping
-      return unless link.is_physical
-      return if country.blank?
-
-      self.shipping_cents = if is_recurring_subscription_charge
-        subscription.original_purchase.shipping_cents
-      elsif is_preorder_charge?
-        preorder.authorization_purchase.shipping_cents
-      else
-        shipping_rate = ShippingDestination.for_product_and_country_code(product: link, country_code: Compliance::Countries.find_by_name(country)&.alpha2)
-        shipping_rate.calculate_shipping_rate(quantity:, currency_type: link.price_currency_type)
+      if already_purchased && is_free_trial_purchase?
+        existing_subscriptions = Subscription.includes(:purchases).where(id: previous_purchases.map(&:subscription_id).compact)
+        return if existing_subscriptions.all? { |s| s.purchases.successful.not_fully_refunded.not_chargedback_or_chargedback_reversed.exists? } # permit purchase if all existing subscriptions have at least one paid charge
+        errors.add(:base, "You've already purchased this product and are ineligible for a free trial. Please visit the Manage Membership page to re-start or make changes to your subscription.")
+      elsif !already_purchased && !is_free_trial_purchase?
+        errors.add(:base, "purchase should be marked as a free trial purchase")
       end
     end
+  end
 
-    def validate_shipping
-      return unless link.is_physical
-      return if country.blank?
+  def gift_purchases_cannot_be_on_installment_plans
+    return unless is_installment_payment?
 
-      if Compliance::Countries.blocked?(Compliance::Countries.find_by_name(country)&.alpha2)
-        self.error_code = PurchaseErrorCode::BLOCKED_SHIPPING_COUNTRY
-        errors.add :base, "The creator cannot ship the product to the country you have selected."
-      elsif ShippingDestination.for_product_and_country_code(product: link, country_code: Compliance::Countries.find_by_name(country)&.alpha2).nil?
-        self.error_code = PurchaseErrorCode::NO_SHIPPING_COUNTRY_CONFIGURED
-        errors.add :base, "The creator cannot ship the product to the country you have selected."
+    if is_gift_sender_purchase? || is_gift_receiver_purchase?
+      errors.add(:base, "Gift purchases cannot be on installment plans.")
+    end
+  end
+
+  def queue_product_cache_invalidation
+    InvalidateProductCacheWorker.perform_in(1.minute, link_id)
+  end
+
+  def set_succeeded_at
+    update(succeeded_at: Time.current) unless succeeded_at.present?
+  end
+
+  def schedule_subscription_jobs
+    if subscription.charges_completed?
+      EndSubscriptionWorker.perform_at(subscription.period.from_now, subscription.id)
+    elsif is_free_trial_purchase?
+      subscription.schedule_charge(subscription.free_trial_ends_at)
+      FreeTrialExpiringReminderWorker.perform_at(subscription.free_trial_ends_at - Subscription::FREE_TRIAL_EXPIRING_REMINDER_EMAIL, subscription_id)
+    else
+      subscription.schedule_renewal_reminder
+      subscription.schedule_charge(succeeded_at + subscription.period)
+    end
+  end
+
+  def schedule_rental_expiration_reminder_emails
+    return if is_gift_sender_purchase
+
+    [7.days, 3.days, 1.day].each do |time_till_rental_expiration|
+      SendRentalExpiresSoonEmailWorker.perform_in(
+        UrlRedirect::TIME_TO_WATCH_RENTED_PRODUCT_AFTER_PURCHASE - time_till_rental_expiration,
+        id,
+        time_till_rental_expiration.to_i)
+    end
+  end
+
+  def schedule_workflow_jobs
+    # for gifts, only send a webhook for the giftee's purchase, not for the gifter's purchase
+    return if is_gift_sender_purchase
+    return if is_recurring_subscription_charge
+
+    after_commit do
+      next if destroyed?
+      ScheduleWorkflowEmailsWorker.perform_in(5.seconds, id)
+    end
+  end
+
+  def send_refunded_notification_webhook
+    return if is_gift_sender_purchase
+
+    PostToPingEndpointsWorker.perform_in(5.seconds, id, url_parameters, ResourceSubscription::REFUNDED_RESOURCE_NAME)
+  end
+
+  def score_product
+    ScoreProductWorker.perform_in(5.seconds, link.id) if run_risk_checks?
+  end
+
+  def check_purchase_heuristics
+    CheckPurchaseHeuristicsWorker.perform_in(5.seconds, id) if run_risk_checks?
+  end
+
+  def log_transition
+    logger.info "Purchase: purchase ID #{id} transitioned to #{purchase_state}"
+  end
+
+  def tax_location_valid?
+    return true if country.nil?
+    return true if link.is_physical || link.require_shipping
+    return true if card_country.nil? && country == ip_country
+    return true if ip_country == link.user.compliance_country_code
+
+    country_code = Compliance::Countries.find_by_name(country)&.alpha2
+    ip_country_code = Compliance::Countries.find_by_name(ip_country)&.alpha2
+
+    ip_and_card_locations = [ip_country_code, card_country]
+
+    taxable_countries = Compliance::Countries::EU_VAT_APPLICABLE_COUNTRY_CODES | Compliance::Countries::GST_APPLICABLE_COUNTRY_CODES | Compliance::Countries::OTHER_TAXABLE_COUNTRY_CODES | Compliance::Countries::NORWAY_VAT_APPLICABLE_COUNTRY_CODES
+    Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS.each do |country_code|
+      taxable_countries << country_code if Feature.active?("collect_tax_#{country_code.downcase}")
+    end
+    Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS.each do |country_code|
+      taxable_countries << country_code if Feature.active?("collect_tax_#{country_code.downcase}") && !link.is_physical?
+    end
+
+    # Perform location checks only when taxed in a taxable country
+    # OR
+    # Both card country and IP country are in a taxable country
+    card_and_ip_country_are_taxable = (ip_and_card_locations & taxable_countries).size == 2
+    card_and_ip_country_are_taxable ||= (ip_and_card_locations.uniq & taxable_countries).size == 1
+    return true if !country_code.in?(taxable_countries) && !card_and_ip_country_are_taxable
+
+    # Reset taxes if we see an election of a taxable country and our basis locations aren't in those countries - final safety measure
+    return false if country_code.in?(taxable_countries) && (ip_and_card_locations & taxable_countries).empty?
+
+    # Country matched
+    return true if country_code.in?(ip_and_card_locations)
+
+    self.error_code = PurchaseErrorCode::TAX_VALIDATION_FAILED
+    errors.add :base, "We could not validate the location you selected. Please review."
+    false
+  end
+
+  def format_price_in_cents(price_cents, format: :long)
+    formatted_price = format_just_price_in_cents(price_cents, displayed_price_currency_type)
+    price = price_for_recurrence
+    return formatted_price if price.nil?
+
+    formatted_price_with_recurrence(formatted_price, price.recurrence, subscription.try(:charge_occurence_count), format:)
+  end
+
+  def update_product_search_index!
+    link.enqueue_index_update_for(%w[is_recommendable])
+
+    # sales_volume needs to be updated asynchronously, because:
+    # - it's based on Product::Stats#total_usd_cents, which itself uses the Purchase index data
+    # - purchases are indexed asynchronously, and the index is also internally refreshed asynchronously
+    # If we indexed sales_volume synchronously, it's likely to fetch outdated data from the purchases index,
+    # thus not reflecting the latest purchase that was just made here.
+    SendToElasticsearchWorker.perform_in(5.seconds, link.id, "update", ["sales_volume", "total_fee_cents", "past_year_fee_cents"])
+  end
+
+  def send_failure_email
+    after_commit do
+      next if destroyed?
+
+      if error_code == PurchaseErrorCode::NET_NEGATIVE_SELLER_REVENUE
+        ContactingCreatorMailer.negative_revenue_sale_failure(id).deliver_later(queue: "critical")
+      elsif paid? && charge_processor_id.in?([PaypalChargeProcessor.charge_processor_id, BraintreeChargeProcessor.charge_processor_id])
+        CustomerMailer.paypal_purchase_failed(id).deliver_later(queue: "critical")
       end
     end
+  end
 
-    def validate_quantity
-      return if quantity > 0
+  def license_json
+    selected_license = linked_license
 
-      self.error_code = PurchaseErrorCode::INVALID_QUANTITY
-      errors.add :base, "Sorry, you've selected an invalid quantity."
+    return {} unless selected_license
+
+    {
+      license_key: selected_license.serial,
+      license_id: selected_license.external_id,
+      license_disabled: selected_license.disabled?,
+      is_multiseat_license: is_multiseat_license?
+    }
+  end
+
+  def subscription_duration
+    price_for_recurrence&.recurrence
+  end
+
+  def attach_credit_card_to_purchaser
+    return if purchaser.credit_card
+
+    latest_successful_purchase =
+      purchaser.purchases.successful.with_credit_card_id.order(created_at: :desc).first
+
+    return unless latest_successful_purchase
+
+    purchaser.credit_card_id = latest_successful_purchase.credit_card_id
+    purchaser.save!
+  end
+
+  def assign_default_rental_expired
+    return unless is_rental_changed?
+    self.rental_expired = is_rental? ? false : nil
+    true
+  end
+
+  def assign_is_multiseat_license
+    self.is_multiseat_license = link.is_multiseat_license?
+  end
+
+  def price_for_recurrence
+    price || subscription&.price
+  end
+
+  def downcase_email
+    return if email.blank?
+    self.email = email.downcase
+  end
+
+  def run_risk_checks?
+    price_cents > 0 && !not_charged? && charged_using_gumroad_merchant_account?
+  end
+
+  def all_workflows
+    link.workflows.alive + seller.workflows.alive.seller_or_audience_type
+  end
+
+  def geo_info
+    @geo_info ||= GeoIp.lookup(ip_address)
+  end
+
+  def has_cached_offer_code?
+    purchase_offer_code_discount.present?
+  end
+
+  def purchasing_power_parity_factor
+    @_purchasing_power_parity_factor ||= PurchasingPowerParityService.new.get_factor(Compliance::Countries.find_by_name(ip_country)&.alpha2, seller)
+  end
+
+  def trigger_iffy_moderation
+    probability = $redis.get(RedisKey.iffy_moderation_probability).to_f || 0.001
+    if rand < probability
+      Iffy::Product::IngestJob.perform_async(link.id)
     end
-
-    def validate_offer_code
-      return if errors.present?
-      # accept the offer code that was used when the buyer preordered/subscribed
-      return if is_preorder_charge? || is_recurring_subscription_charge || is_gift_receiver_purchase
-      return if discount_code.blank?
-
-      if offer_code.nil?
-        self.error_code = PurchaseErrorCode::OFFER_CODE_INVALID
-        errors.add :base, "Sorry, the discount code you wish to use is invalid."
-        return
-      end
-
-      if offer_code.inactive?
-        self.error_code = PurchaseErrorCode::OFFER_CODE_INACTIVE
-        errors.add :base, "Sorry, the discount code you wish to use is inactive."
-        return
-      end
-
-      unless quantity >= (offer_code.minimum_quantity || 0)
-        self.error_code = PurchaseErrorCode::OFFER_CODE_INSUFFICIENT_QUANTITY
-        errors.add :base, "Sorry, the discount code you wish to use has an unmet minimum quantity."
-        return
-      end
-
-      return if offer_code.is_valid_for_purchase?(purchase_quantity: quantity)
-
-      if offer_code.quantity_left > 0
-        self.error_code = PurchaseErrorCode::EXCEEDING_OFFER_CODE_QUANTITY
-        errors.add :base, "Sorry, the discount code you are using is invalid for the quantity you have selected."
-      else
-        self.error_code = PurchaseErrorCode::OFFER_CODE_SOLD_OUT
-        errors.add :base, "Sorry, the discount code you wish to use has expired."
-      end
-
-      true
-    end
-
-    def validate_subscription
-      return unless is_recurring_subscription_charge
-      return if subscription.alive?
-
-      self.error_code = PurchaseErrorCode::SUBSCRIPTION_INACTIVE
-      errors.add :base, "This subscription has been canceled."
-    end
-
-    def perceived_price_cents_matches_price_cents
-      return if errors.present?
-      return if perceived_price_cents.nil?
-      return if is_upgrade_purchase?
-      return if is_commission_completion_purchase?
-      return if is_applying_plan_change
-      return if perceived_price_equals_link_price?
-      return if customizable_price_that_has_not_changed?
-
-      self.error_code = PurchaseErrorCode::PERCEIVED_PRICE_CENTS_NOT_MATCHING
-      errors.add(:price_cents, "The price just changed! Refresh the page for the updated price.")
-      true
-    end
-
-    def determine_customized_price_cents
-      customizable_price? ? perceived_price_cents : nil
-    end
-
-    def calculate_installment_payment_price_cents(total_price_cents)
-      return unless is_installment_payment
-
-      nth_installment = subscription&.purchases&.successful&.count || 0
-      installment_payments = fetch_installment_plan.calculate_installment_payment_price_cents(total_price_cents)
-      installment_payments[nth_installment] || installment_payments.last
-    end
-
-    def calculate_price_range_cents
-      return unless price_range
-
-      clean = price_range.to_s
-
-      unless link.single_unit_currency?
-        clean = clean.gsub(/[^-0-9.,]/, "") # allow commas for now
-        if clean.rindex(/,/).present? && clean.rindex(/,/) >= clean.length - 3 # euro style!
-          clean = clean.delete(".") # remove euro 1000^x delimiters
-          clean = clean.tr(",", ".")             # replace euro comma with decimal
-        end
-      end
-      clean = clean.gsub(/[^-0-9.]/, "")         # remove commas
-
-      string_to_price_cents(link.price_currency_type.to_sym, clean)
-    end
-
-    def perceived_price_equals_link_price?
-      [minimum_paid_price_cents, minimum_paid_price_cents - 1].include?(perceived_price_cents.to_i)
-    end
-
-    def customizable_price_that_has_not_changed?
-      customizable_price? && perceived_price_cents.to_i >= minimum_paid_price_cents
-    end
-
-    def sold_out
-      # Allow recurring billing and pre-order charges even after the product is sold out.
-      return if does_not_count_towards_max_purchases
-      return if link.max_purchase_count.nil?
-      return if (link.sales_count_for_inventory + quantity) <= link.max_purchase_count
-
-      if link.sales_count_for_inventory == link.max_purchase_count
-        self.error_code = PurchaseErrorCode::PRODUCT_SOLD_OUT
-        errors.add :base, "Sold out, please go back and pick another option."
-      else
-        self.error_code = PurchaseErrorCode::EXCEEDING_PRODUCT_QUANTITY
-        errors.add :base, "You have chosen a quantity that exceeds what is available."
-      end
-    end
-
-    def variants_available
-      return if does_not_count_towards_max_purchases
-      return if link.variant_categories_alive.empty?
-      new_variants_available = new_variants.empty? || new_variants.map(&:available?).reduce { |a, e| a && e }
-
-      return if new_variants_available && variants_available_for_quantity?
-
-      if !new_variants_available
-        self.error_code = PurchaseErrorCode::VARIANT_SOLD_OUT
-        errors.add :base, "Sold out, please go back and pick another option."
-      else
-        self.error_code = PurchaseErrorCode::EXCEEDING_VARIANT_QUANTITY
-        errors.add :base, "You have chosen a quantity that exceeds what is available."
-      end
-    end
-
-    def variants_available_for_quantity?
-      new_variants.map(&:quantity_left).each do |quantity_left|
-        return false if quantity_left && quantity_left < quantity
-      end
-
-      true
-    end
-
-    def new_variants
-      original_variant_attributes.present? ? variant_attributes - original_variant_attributes : variant_attributes
-    end
-
-    def variants_satisfied
-      return if is_preorder_charge?
-      return if is_commission_completion_purchase?
-      return if is_recurring_subscription_charge
-      return if link.native_type == Link::NATIVE_TYPE_COFFEE
-
-      if link.skus_enabled
-        return if variant_attributes.length == 1 && link.skus.alive.where(id: variant_attributes.first.id).exists?
-        return if variant_attributes.empty? && link.skus.alive.empty?
-      else
-        return if (link.variant_categories_alive.map(&:id) & variant_attributes.map(&:variant_category_id)).count == link.variant_categories_alive.count
-      end
-
-      self.error_code = PurchaseErrorCode::MISSING_VARIANTS
-      errors.add :base, "The product's variants have changed, please refresh the page!"
-    end
-
-    def product_is_sellable
-      return if is_recurring_subscription_charge || is_preorder_charge? || is_test_purchase? || is_updated_original_subscription_purchase || is_commission_completion_purchase
-      return unless seller.suspended? || !link.alive?
-
-      self.error_code = PurchaseErrorCode::NOT_FOR_SALE
-      errors.add :base, "This product is not currently for sale."
-    end
-
-    def product_is_not_blocked
-      return if price_cents.zero?
-      return if Feature.inactive?(:block_purchases_on_product)
-      return if BlockedObject.product.find_active_object(link_id).blank?
-
-      self.error_code = PurchaseErrorCode::TEMPORARILY_BLOCKED_PRODUCT
-      errors.add :base, "Your card was not charged."
-    end
-
-    def validate_purchase_type
-      if is_rental && link.buy_only?
-        self.error_code = PurchaseErrorCode::NOT_FOR_RENT
-        errors.add :base, "This product cannot be rented."
-      elsif !is_rental && link.rent_only?
-        self.error_code = PurchaseErrorCode::ONLY_FOR_RENT
-        errors.add :base, "This product can only be rented."
-      end
-    end
-
-    def not_double_charged
-      return if is_bundle_product_purchase
-      return if is_automatic_charge
-      return if is_gift_receiver_purchase
-      return if is_updated_original_subscription_purchase
-      return if is_commission_completion_purchase
-      return if link.allow_double_charges
-
-      cancel_parallel_charge_intents
-
-      limiting_purchase_states = [
-        is_preorder_authorization ? "preorder_authorization_successful" : "successful",
-        "in_progress"
-      ]
-
-      last_allowed_purchase_at = if is_upgrade_purchase? || link.quantity_enabled || link.is_physical || link.is_licensed
-        10.seconds.ago
-      else
-        3.minutes.ago
-      end
-
-      recipient_email = is_gift_sender_purchase ? giftee_email : email
-      already = self.class.where(
-        email: recipient_email,
-        ip_address:,
-        link_id: link.id,
-        purchase_state: limiting_purchase_states
-      ).where("purchases.created_at > ?", last_allowed_purchase_at)
-
-      already = already.where("purchases.id != ?", id) if id
-      already = already.not_is_gift_sender_purchase unless is_gift_sender_purchase
-
-      already += self.class.joins(:gift_given).where(
-        gifts: { giftee_email: recipient_email },
-        link:,
-        purchase_state: limiting_purchase_states
-      ) unless is_recurring_subscription_charge
-
-      if variant_attributes.present?
-        already = already.select do |purchase|
-          purchase.variant_attributes.sort == variant_attributes.sort
-        end
-      end
-
-      add_errors_for_existing_purchase(already)
-    end
-
-    def cancel_parallel_charge_intents
-      potential_duplicates = self.class.where(
-        browser_guid:,
-        link_id: link.id,
-        purchase_state: "in_progress"
-      ).where.not(processor_payment_intent_id: nil)
-       .where("created_at > ?", 1.hour.ago)
-
-      potential_duplicates.each(&:cancel_charge_intent)
-    end
-
-    def add_errors_for_existing_purchase(purchases)
-      if purchases.any?(&:successful?)
-        errors.add :base, "You have already paid for this product. It has been emailed to you."
-      elsif purchases.any?(&:preorder_authorization_successful?)
-        errors.add :base, "You have already pre-ordered this product. A confirmation has been emailed to you."
-      elsif purchases.any?(&:in_progress?)
-        errors.add :base, "You have already attempted to purchase this product. We will email you shortly if the purchase is successful."
-      end
-    end
-
-    def must_have_valid_email
-      return if email && !email_changed?
-
-      errors.add(:base, "valid email required") unless EmailFormatValidator.valid?(email)
-    end
-
-    def seller_is_link_user
-      errors.add(:base, "link does not belong to user") unless seller == link.user
-    end
-
-    def free_trial_purchase_set_correctly
-      return if !is_free_trial_purchase? && !link.free_trial_enabled?
-      return if gift.present?
-
-      if is_free_trial_purchase? && !link.free_trial_enabled? && !is_updated_original_subscription_purchase
-        errors.add(:base, "free trial must be enabled on the product")
-        return
-      end
-
-      if is_free_trial_purchase? && is_recurring_subscription_charge
-        errors.add(:base, "recurring charges should not be marked as free trial purchases")
-        return
-      end
-
-      if is_original_subscription_purchase? && !is_updated_original_subscription_purchase
-        previous_purchases = link.sales.all_success_states.where(email:).where.not(subscription_id:)
-        already_purchased = previous_purchases.exists?
-
-        if already_purchased && is_free_trial_purchase?
-          existing_subscriptions = Subscription.includes(:purchases).where(id: previous_purchases.map(&:subscription_id).compact)
-          return if existing_subscriptions.all? { |s| s.purchases.successful.not_fully_refunded.not_chargedback_or_chargedback_reversed.exists? } # permit purchase if all existing subscriptions have at least one paid charge
-          errors.add(:base, "You've already purchased this product and are ineligible for a free trial. Please visit the Manage Membership page to re-start or make changes to your subscription.")
-        elsif !already_purchased && !is_free_trial_purchase?
-          errors.add(:base, "purchase should be marked as a free trial purchase")
-        end
-      end
-    end
-
-    def gift_purchases_cannot_be_on_installment_plans
-      return unless is_installment_payment?
-
-      if is_gift_sender_purchase? || is_gift_receiver_purchase?
-        errors.add(:base, "Gift purchases cannot be on installment plans.")
-      end
-    end
-
-    def queue_product_cache_invalidation
-      InvalidateProductCacheWorker.perform_in(1.minute, link_id)
-    end
-
-    def set_succeeded_at
-      update(succeeded_at: Time.current) unless succeeded_at.present?
-    end
-
-    def schedule_subscription_jobs
-      if subscription.charges_completed?
-        EndSubscriptionWorker.perform_at(subscription.period.from_now, subscription.id)
-      elsif is_free_trial_purchase?
-        subscription.schedule_charge(subscription.free_trial_ends_at)
-        FreeTrialExpiringReminderWorker.perform_at(subscription.free_trial_ends_at - Subscription::FREE_TRIAL_EXPIRING_REMINDER_EMAIL, subscription_id)
-      else
-        subscription.schedule_renewal_reminder
-        subscription.schedule_charge(succeeded_at + subscription.period)
-      end
-    end
-
-    def schedule_rental_expiration_reminder_emails
-      return if is_gift_sender_purchase
-
-      [7.days, 3.days, 1.day].each do |time_till_rental_expiration|
-        SendRentalExpiresSoonEmailWorker.perform_in(
-          UrlRedirect::TIME_TO_WATCH_RENTED_PRODUCT_AFTER_PURCHASE - time_till_rental_expiration,
-          id,
-          time_till_rental_expiration.to_i)
-      end
-    end
-
-    def schedule_workflow_jobs
-      # for gifts, only send a webhook for the giftee's purchase, not for the gifter's purchase
-      return if is_gift_sender_purchase
-      return if is_recurring_subscription_charge
-
-      after_commit do
-        next if destroyed?
-        ScheduleWorkflowEmailsWorker.perform_in(5.seconds, id)
-      end
-    end
-
-    def send_refunded_notification_webhook
-      return if is_gift_sender_purchase
-
-      PostToPingEndpointsWorker.perform_in(5.seconds, id, url_parameters, ResourceSubscription::REFUNDED_RESOURCE_NAME)
-    end
-
-    def score_product
-      ScoreProductWorker.perform_in(5.seconds, link.id) if run_risk_checks?
-    end
-
-    def check_purchase_heuristics
-      CheckPurchaseHeuristicsWorker.perform_in(5.seconds, id) if run_risk_checks?
-    end
-
-    def log_transition
-      logger.info "Purchase: purchase ID #{id} transitioned to #{purchase_state}"
-    end
-
-    def tax_location_valid?
-      return true if country.nil?
-      return true if link.is_physical || link.require_shipping
-      return true if card_country.nil? && country == ip_country
-      return true if ip_country == link.user.compliance_country_code
-
-      country_code = Compliance::Countries.find_by_name(country)&.alpha2
-      ip_country_code = Compliance::Countries.find_by_name(ip_country)&.alpha2
-
-      ip_and_card_locations = [ip_country_code, card_country]
-
-      taxable_countries = Compliance::Countries::EU_VAT_APPLICABLE_COUNTRY_CODES | Compliance::Countries::GST_APPLICABLE_COUNTRY_CODES | Compliance::Countries::OTHER_TAXABLE_COUNTRY_CODES | Compliance::Countries::NORWAY_VAT_APPLICABLE_COUNTRY_CODES
-      Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_ALL_PRODUCTS.each do |country_code|
-        taxable_countries << country_code if Feature.active?("collect_tax_#{country_code.downcase}")
-      end
-      Compliance::Countries::COUNTRIES_THAT_COLLECT_TAX_ON_DIGITAL_PRODUCTS.each do |country_code|
-        taxable_countries << country_code if Feature.active?("collect_tax_#{country_code.downcase}") && !link.is_physical?
-      end
-
-      # Perform location checks only when taxed in a taxable country
-      # OR
-      # Both card country and IP country are in a taxable country
-      card_and_ip_country_are_taxable = (ip_and_card_locations & taxable_countries).size == 2
-      card_and_ip_country_are_taxable ||= (ip_and_card_locations.uniq & taxable_countries).size == 1
-      return true if !country_code.in?(taxable_countries) && !card_and_ip_country_are_taxable
-
-      # Reset taxes if we see an election of a taxable country and our basis locations aren't in those countries - final safety measure
-      return false if country_code.in?(taxable_countries) && (ip_and_card_locations & taxable_countries).empty?
-
-      # Country matched
-      return true if country_code.in?(ip_and_card_locations)
-
-      self.error_code = PurchaseErrorCode::TAX_VALIDATION_FAILED
-      errors.add :base, "We could not validate the location you selected. Please review."
-      false
-    end
-
-    def format_price_in_cents(price_cents, format: :long)
-      formatted_price = format_just_price_in_cents(price_cents, displayed_price_currency_type)
-      price = price_for_recurrence
-      return formatted_price if price.nil?
-
-      formatted_price_with_recurrence(formatted_price, price.recurrence, subscription.try(:charge_occurence_count), format:)
-    end
-
-    def update_product_search_index!
-      link.enqueue_index_update_for(%w[is_recommendable])
-
-      # sales_volume needs to be updated asynchronously, because:
-      # - it's based on Product::Stats#total_usd_cents, which itself uses the Purchase index data
-      # - purchases are indexed asynchronously, and the index is also internally refreshed asynchronously
-      # If we indexed sales_volume synchronously, it's likely to fetch outdated data from the purchases index,
-      # thus not reflecting the latest purchase that was just made here.
-      SendToElasticsearchWorker.perform_in(5.seconds, link.id, "update", ["sales_volume", "total_fee_cents", "past_year_fee_cents"])
-    end
-
-    def send_failure_email
-      after_commit do
-        next if destroyed?
-
-        if error_code == PurchaseErrorCode::NET_NEGATIVE_SELLER_REVENUE
-          ContactingCreatorMailer.negative_revenue_sale_failure(id).deliver_later(queue: "critical")
-        elsif paid? && charge_processor_id.in?([PaypalChargeProcessor.charge_processor_id, BraintreeChargeProcessor.charge_processor_id])
-          CustomerMailer.paypal_purchase_failed(id).deliver_later(queue: "critical")
-        end
-      end
-    end
-
-    def license_json
-      selected_license = linked_license
-
-      return {} unless selected_license
-
-      {
-        license_key: selected_license.serial,
-        license_id: selected_license.external_id,
-        license_disabled: selected_license.disabled?,
-        is_multiseat_license: is_multiseat_license?
-      }
-    end
-
-    def subscription_duration
-      price_for_recurrence&.recurrence
-    end
-
-    def attach_credit_card_to_purchaser
-      return if purchaser.credit_card
-
-      latest_successful_purchase =
-        purchaser.purchases.successful.with_credit_card_id.order(created_at: :desc).first
-
-      return unless latest_successful_purchase
-
-      purchaser.credit_card_id = latest_successful_purchase.credit_card_id
-      purchaser.save!
-    end
-
-    def assign_default_rental_expired
-      return unless is_rental_changed?
-      self.rental_expired = is_rental? ? false : nil
-      true
-    end
-
-    def assign_is_multiseat_license
-      self.is_multiseat_license = link.is_multiseat_license?
-    end
-
-    def price_for_recurrence
-      price || subscription&.price
-    end
-
-    def downcase_email
-      return if email.blank?
-      self.email = email.downcase
-    end
-
-    def run_risk_checks?
-      price_cents > 0 && !not_charged? && charged_using_gumroad_merchant_account?
-    end
-
-    def all_workflows
-      link.workflows.alive + seller.workflows.alive.seller_or_audience_type
-    end
-
-    def geo_info
-      @geo_info ||= GeoIp.lookup(ip_address)
-    end
-
-    def has_cached_offer_code?
-      purchase_offer_code_discount.present?
-    end
-
-    def purchasing_power_parity_factor
-      @_purchasing_power_parity_factor ||= PurchasingPowerParityService.new.get_factor(Compliance::Countries.find_by_name(ip_country)&.alpha2, seller)
-    end
-
-    def trigger_iffy_moderation
-      probability = $redis.get(RedisKey.iffy_moderation_probability).to_f || 0.001
-      if rand < probability
-        Iffy::Product::IngestJob.perform_async(link.id)
-      end
-    end
-
-    def fetch_installment_plan
-      installment_plan || subscription&.last_payment_option&.installment_plan
-    end
+  end
 end

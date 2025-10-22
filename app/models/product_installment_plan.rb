@@ -56,6 +56,11 @@ class ProductInstallmentPlan < ApplicationRecord
     end
   end
 
+  def price_for_installment(nth_installment, total_price_cents)
+    payments = calculate_installment_payment_price_cents(total_price_cents)
+    payments[nth_installment] || payments.last
+  end
+
   def destroy_if_no_payment_options!
     destroy!
   rescue ActiveRecord::DeleteRestrictionError

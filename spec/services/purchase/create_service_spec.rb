@@ -3367,8 +3367,10 @@ describe Purchase::CreateService, :vcr do
       expect(purchase.subscription).to have_attributes(
         is_installment_plan: true,
         charge_occurrence_count: 3,
-        recurrence: "monthly",
-      )
+        recurrence: "monthly"
+        )
+      expect(purchase.total_price_before_installments_cents).to eq(600)
+      expect(purchase.minimum_paid_price_cents).to eq(200)
       expect(purchase.subscription.credit_card).to be_present
       expect(purchase.subscription.last_payment_option.installment_plan).to eq(installment_plan)
     end
@@ -3405,5 +3407,17 @@ describe Purchase::CreateService, :vcr do
       expect(purchase).to be_nil
       expect(error).to eq("Gift purchases cannot be on installment plans.")
     end
+
+    # context "installment plan total price storage" do
+
+    #   it "does not store total price on recurring installment purchase" do
+    #     create(:purchase, link: product, price_cents: product.price_cents, is_original_subscription_purchase: true, subscription:, is_installment_payment: true, installment_plan:)
+    #     recurring_purchase = create(:purchase, link: product, price_cents: product.price_cents, is_original_subscription_purchase: false, subscription:, is_installment_payment: true, installment_plan:)
+    #     recurring_purchase.set_price_and_rate
+    #     recurring_purchase.save!
+    #     expect(recurring_purchase.is_installment_payment).to be true
+    #     expect(recurring_purchase.total_price_before_installments_cents).to be_nil
+    #   end
+    # end
   end
 end

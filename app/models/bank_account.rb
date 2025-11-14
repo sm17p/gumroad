@@ -3,6 +3,7 @@
 class BankAccount < ApplicationRecord
   include ExternalId
   include Deletable
+  include AttributeBlockable
 
   belongs_to :user, optional: true
   has_many :payments
@@ -16,12 +17,15 @@ class BankAccount < ApplicationRecord
 
   alias_attribute :stripe_external_account_id, :stripe_bank_account_id
 
+  attr_blockable :stripe_fingerprint, object_type: :charge_processor_fingerprint
+
   validates_presence_of :user, :account_number, :account_number_last_four, :account_holder_full_name,
                         message: "We could not save your bank account information."
 
   after_create_commit :handle_stripe_bank_account
   after_create_commit :handle_compliance_info_request
   after_create :update_user_products_search_index
+  after_update_commit :check_seller_stripe_fingerprint_for_fraud, if: :saved_change_to_stripe_fingerprint?
 
   # This state machine can be expanded once we implement a complex verification process.
   state_machine(:state, initial: :unverified) do
@@ -29,6 +33,14 @@ class BankAccount < ApplicationRecord
       transition unverified: :verified
     end
   end
+
+  scope :with_stripe_fingerprint, -> (fingerprint) {
+    left_joins(:credit_card)
+      .where(
+        "bank_accounts.stripe_fingerprint = ? OR credit_cards.stripe_fingerprint = ?",
+        fingerprint, fingerprint
+      )
+  }
 
   # Public: The routing transit number that is the identifier used to reference
   # the final destination institution/location where the funds will be delivered.
@@ -97,6 +109,10 @@ class BankAccount < ApplicationRecord
 
     def handle_compliance_info_request
       UserComplianceInfoRequest.handle_new_bank_account(self)
+    end
+
+    def check_seller_stripe_fingerprint_for_fraud
+      CheckSellerStripeFingerprintWorker.perform_async(id)
     end
 
     def account_number_decrypted

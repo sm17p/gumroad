@@ -1745,6 +1745,42 @@ describe User, :vcr do
       @user.suspend_for_fraud(author_id: @admin_user.id)
     end
 
+    it "blocks seller stripe_fingerprint" do
+      fingerprint = SecureRandom.hex(16)
+      bank_account = create(:ach_account, user: @user, stripe_fingerprint: fingerprint)
+
+      expect(bank_account.blocked_by_stripe_fingerprint?).to be(false)
+      @user.flag_for_fraud(author_id: @admin_user.id)
+      @user.suspend_for_fraud(author_id: @admin_user.id)
+      expect(bank_account.reload.blocked_by_stripe_fingerprint?).to be(true)
+    end
+
+    it "unblocks seller stripe_fingerprint when marked compliant" do
+      fingerprint = SecureRandom.hex(16)
+      bank_account = create(:ach_account, user: @user, stripe_fingerprint: fingerprint)
+
+      expect(bank_account.blocked_by_stripe_fingerprint?).to be(false)
+      @user.flag_for_fraud!(author_id: @admin_user.id)
+      @user.suspend_for_fraud!(author_id: @admin_user.id)
+      expect(bank_account.reload.blocked_by_stripe_fingerprint?).to be(true)
+
+      @user.mark_compliant!(author_id: @admin_user.id)
+      expect(bank_account.reload.blocked_by_stripe_fingerprint?).to be(false)
+    end
+
+    it "unblocks seller stripe_fingerprint when put on probation" do
+      fingerprint = SecureRandom.hex(16)
+      bank_account = create(:ach_account, user: @user, stripe_fingerprint: fingerprint)
+
+      expect(bank_account.blocked_by_stripe_fingerprint?).to be(false)
+      @user.flag_for_fraud!(author_id: @admin_user.id)
+      @user.suspend_for_fraud!(author_id: @admin_user.id)
+      expect(bank_account.reload.blocked_by_stripe_fingerprint?).to be(true)
+
+      @user.put_on_probation(author_id: @admin_user.id)
+      expect(bank_account.reload.blocked_by_stripe_fingerprint?).to be(false)
+    end
+
     context "when user has a custom domain" do
       before do
         @custom_domain = create(:custom_domain, user: @user)
@@ -1891,6 +1927,22 @@ describe User, :vcr do
 
         @user.mark_compliant(author_id: @admin_user.id)
         expect(@user_2.reload.suspended?).to be(false)
+      end
+
+      it "re-enables sellers with same stripe fingerprint when marked compliant", :sidekiq_inline do
+        fingerprint = SecureRandom.hex(16)
+        user1 = create(:user)
+        user2 = create(:user)
+        create(:ach_account, user: user1, stripe_fingerprint: fingerprint)
+        create(:ach_account, user: user2, stripe_fingerprint: fingerprint)
+
+        user1.flag_for_fraud(author_id: @admin_user.id)
+        user1.suspend_for_fraud(author_id: @admin_user.id)
+        expect(user2.reload.suspended?).to be(true)
+
+        user1.mark_compliant!(author_name: "admin")
+
+        expect(user2.reload.user_risk_state).to eq("compliant")
       end
 
       it "re-enables all the sellers links if the seller is marked compliant" do

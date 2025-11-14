@@ -42,4 +42,28 @@ describe User::Risk do
       expect(result.to_a).to eq([user])
     end
   end
+
+  describe "#suspend_sellers_other_accounts" do
+    it "calls both PayPal and Stripe fingerprint workers" do
+      user = create(:user, payment_address: "test@example.com")
+      create(:ach_account, user: user, stripe_fingerprint: SecureRandom.hex(16))
+
+      expect(SuspendAccountsWithPaymentAddressWorker).to receive(:perform_in).with(5.seconds, user.id)
+      expect(SuspendAccountsWithStripeFingerprintWorker).to receive(:perform_in).with(5.seconds, user.id)
+
+      user.suspend_sellers_other_accounts
+    end
+  end
+
+  describe "#enable_sellers_other_accounts" do
+    it "processes payment address synchronously and calls worker for stripe fingerprint" do
+      fingerprint = SecureRandom.hex(16)
+      user = create(:user, payment_address: "test@example.com")
+      create(:ach_account, user: user, stripe_fingerprint: fingerprint)
+
+      expect(EnableSellersOtherStripeAccountsWorker).to receive(:perform_async).with(fingerprint)
+
+      user.enable_sellers_other_accounts
+    end
+  end
 end

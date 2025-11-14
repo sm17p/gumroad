@@ -13,6 +13,8 @@ class CardBankAccount < BankAccount
   # TODO: Clean up data and apply the validation on all actions when possible.
   validate :validate_credit_card_is_not_fraudy, on: :create
 
+  after_create_commit :check_seller_stripe_fingerprint_for_fraud, if: -> { stripe_fingerprint.present? }
+
   def bank_account_type
     BANK_ACCOUNT_TYPE
   end
@@ -43,6 +45,10 @@ class CardBankAccount < BankAccount
 
   def currency
     Currency::USD
+  end
+
+  def stripe_fingerprint
+    self[:stripe_fingerprint].presence || credit_card&.stripe_fingerprint
   end
 
   private

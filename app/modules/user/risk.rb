@@ -122,22 +122,46 @@ module User::Risk
 
   def suspend_sellers_other_accounts
     SuspendAccountsWithPaymentAddressWorker.perform_in(5.seconds, id)
+    SuspendAccountsWithStripeFingerprintWorker.perform_in(5.seconds, id)
   end
 
   def block_seller_ip!
     BlockSuspendedAccountIpWorker.perform_in(5.seconds, id)
   end
 
-  def enable_sellers_other_accounts
-    return if payment_address.blank?
+  def block_seller_stripe_fingerprint!(transition)
+    return if active_bank_account.blocked_by_stripe_fingerprint?
 
-    User.where(payment_address:).where.not(id:).each do |user|
-      user.mark_compliant!(author_name: "enable_sellers_other_accounts", content: "Marked compliant automatically on #{Time.current.to_fs(:formatted_date_full_month)} as payment address #{payment_address} is now unblocked")
+    stripe_fingerprint = active_bank_account&.stripe_fingerprint
+    return if stripe_fingerprint.blank?
+
+    author_id = transition.args.first&.dig(:author_id)
+    active_bank_account.block_by_stripe_fingerprint!(by_user_id: author_id)
+  end
+
+  def enable_sellers_other_accounts
+    if payment_address.present?
+      User.where(payment_address:).where.not(id:).suspended.find_each do |user|
+        user.mark_compliant!(
+          author_name: "enable_sellers_other_accounts",
+          content: "Marked compliant automatically on #{Time.current.to_fs(:formatted_date_full_month)} as payment address #{payment_address} is now unblocked"
+        )
+      end
     end
+
+    stripe_fingerprint = active_bank_account&.stripe_fingerprint
+    EnableSellersOtherStripeAccountsWorker.perform_async(stripe_fingerprint) if stripe_fingerprint.present?
   end
 
   def unblock_seller_ip!
     BlockedObject.unblock!(last_sign_in_ip) if last_sign_in_ip.present?
+  end
+
+  def unblock_seller_stripe_fingerprint!
+    stripe_fingerprint = active_bank_account&.stripe_fingerprint
+    return if stripe_fingerprint.blank?
+
+    active_bank_account.unblock_by_stripe_fingerprint!
   end
 
   def delete_custom_domain!

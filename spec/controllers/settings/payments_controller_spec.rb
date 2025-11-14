@@ -1074,6 +1074,22 @@ describe Settings::PaymentsController, :vcr do
         expect(credit_card.expiry_month).to eq(11)
         expect(credit_card.expiry_year).to eq(2026)
       end
+
+      it "flags the user for fraud when card has a blocked stripe_fingerprint", :sidekiq_inline do
+        card_token = Stripe::Token.retrieve(CardParamsSpecHelper.success_debit_visa[:token])
+        fingerprint = card_token.card.fingerprint
+        BlockedObject.block!(BLOCKED_OBJECT_TYPES[:charge_processor_fingerprint], fingerprint, nil)
+
+        expect(user.flagged?).to be(false)
+
+        put :update, xhr: true, params: @card_params.call
+
+        expect(response.parsed_body["success"]).to be(true)
+        expect(user.reload.flagged?).to be(true)
+        expect(user.active_bank_account).to be_an_instance_of(CardBankAccount)
+        expect(user.active_bank_account.stripe_fingerprint).to eq(fingerprint)
+        expect(user.comments.last.content).to include("Flagged for fraud automatically", "because of usage of Stripe fingerprint #{fingerprint}")
+      end
     end
 
     context "when updating country" do

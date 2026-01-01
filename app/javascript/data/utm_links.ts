@@ -36,7 +36,6 @@ export type UtmLinksStats = Record<string, UtmLinkStats>;
 
 export type UtmLinkFormStaticMetaData = {
   destination_options: UtmLinkDestinationOption[];
-  short_url: string;
   utm_fields_values: {
     campaigns: string[];
     mediums: string[];
@@ -44,41 +43,31 @@ export type UtmLinkFormStaticMetaData = {
     terms: string[];
     contents: string[];
   };
-};
-
-export type UtmLinkFormDynamicMetaData = {
-  new_permalink: string;
-};
-
-export type UtmLinkNewPageProps = {
-  context: UtmLinkFormStaticMetaData;
-  additional_metadata?: UtmLinkFormDynamicMetaData;
-  utm_link: UtmLink | null;
-};
-
-export type UtmLinkEditPageProps = {
-  context: UtmLinkFormStaticMetaData;
-  utm_link: SavedUtmLink;
-};
-
-export type UtmLinkIndexPageProps = {
-  utm_links_props: {
-    utm_links: SavedUtmLink[];
-    pagination: import("$app/components/Pagination").PaginationProps;
-  };
-  utm_links_stats?: UtmLinksStats;
+  short_url_prefix: string;
+  short_url_protocol: string;
 };
 
 export type UtmLinkFormData = {
   title: string;
-  target_resource_type: string;
+  destination_option: UtmLinkDestinationOption | null;
+  target_resource_type: string | null;
   target_resource_id: string | null;
   permalink: string;
-  utm_source: string;
-  utm_medium: string;
-  utm_campaign: string;
+  utm_source: string | null;
+  utm_medium: string | null;
+  utm_campaign: string | null;
   utm_term: string | null;
   utm_content: string | null;
+};
+
+export type UtmLinkNewPageProps = {
+  context: UtmLinkFormStaticMetaData;
+  utm_link: UtmLinkFormData;
+};
+
+export type UtmLinkEditPageProps = {
+  context: UtmLinkFormStaticMetaData;
+  utm_link: UtmLinkFormData & { id: string };
 };
 
 export type SortKey =

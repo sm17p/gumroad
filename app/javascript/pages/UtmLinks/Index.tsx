@@ -2,7 +2,7 @@ import { Link, router, usePage } from "@inertiajs/react";
 import React from "react";
 import { cast } from "ts-safe-cast";
 
-import { SortKey, SavedUtmLink, UtmLinkIndexPageProps, UtmLinkStats } from "$app/data/utm_links";
+import { SortKey, SavedUtmLink, UtmLinkStats, UtmLinksStats } from "$app/data/utm_links";
 
 import { AnalyticsLayout } from "$app/components/Analytics/AnalyticsLayout";
 import { Button } from "$app/components/Button";
@@ -55,6 +55,14 @@ const extractSortParam = (rawParams: URLSearchParams): Sort<SortKey> | null => {
     default:
       return null;
   }
+};
+
+export type UtmLinkIndexPageProps = {
+  utm_links_props: {
+    utm_links: SavedUtmLink[];
+    pagination: import("$app/components/Pagination").PaginationProps;
+  };
+  utm_links_stats?: UtmLinksStats;
 };
 
 const UtmLinksIndex = () => {

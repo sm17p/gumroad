@@ -185,30 +185,32 @@ describe UtmLinksController, inertia: true do
       let(:record) { UtmLink }
     end
 
-    it "renders UtmLinks/New with Inertia and correct props" do
+    it "renders Inertia component with correct props" do
+      allow(SecureRandom).to receive(:alphanumeric).and_return("unique01")
       get :new
 
       expect(response).to be_successful
       expect(inertia).to render_component("UtmLinks/New")
       expect(inertia.props[:context]).to be_present
       expect(inertia.props[:context][:destination_options]).to be_an(Array)
-      expect(inertia.props[:context][:short_url]).to be_present
       expect(inertia.props[:context][:utm_fields_values]).to be_present
-      expect(inertia.props[:additional_metadata]).to be_nil
+      expect(inertia.props[:context][:short_url_prefix]).to eq(UtmLink.short_url_prefix)
+      expect(inertia.props[:context][:short_url_protocol]).to eq(PROTOCOL)
+      expect(inertia.props.deep_symbolize_keys[:utm_link][:permalink]).to eq("unique01")
     end
 
-    context "with only=[\"additional_metadata\"] partial loading" do
+    context "with partial request" do
       before do
         request.headers["X-Inertia"] = "true"
         request.headers["X-Inertia-Partial-Component"] = "UtmLinks/New"
-        request.headers["X-Inertia-Partial-Data"] = "additional_metadata"
+        request.headers["X-Inertia-Partial-Data"] = "utm_link"
       end
 
       it "returns a new unique permalink" do
         get :new
 
         expect(response).to be_successful
-        expect(inertia.props["additional_metadata"]["new_permalink"]).to be_present
+        expect(inertia.props.deep_symbolize_keys[:utm_link][:permalink]).to be_present
       end
     end
 
@@ -223,6 +225,7 @@ describe UtmLinksController, inertia: true do
         expect(inertia.props[:utm_link]).to be_present
         expect(inertia.props[:utm_link][:title]).to eq("#{source_link.title} (copy)")
         expect(inertia.props[:utm_link][:id]).to be_nil
+        expect(inertia.props.deep_symbolize_keys[:utm_link][:permalink]).not_to eq(source_link.permalink)
       end
     end
   end
@@ -239,7 +242,7 @@ describe UtmLinksController, inertia: true do
       let(:request_params) { { id: utm_link.external_id } }
     end
 
-    it "renders UtmLinks/Edit with Inertia and correct props" do
+    it "renders Inertia component with correct props" do
       get :edit, params: { id: utm_link.external_id }
 
       expect(response).to be_successful
@@ -247,8 +250,10 @@ describe UtmLinksController, inertia: true do
       expect(inertia.props[:context]).to be_present
       expect(inertia.props[:context][:destination_options]).to be_an(Array)
       expect(inertia.props[:utm_link]).to be_present
+      expect(inertia.props[:context][:short_url_prefix]).to eq(UtmLink.short_url_prefix)
+      expect(inertia.props[:context][:short_url_protocol]).to eq(PROTOCOL)
       expect(inertia.props[:utm_link][:id]).to eq(utm_link.external_id)
-      expect(inertia.props[:utm_link][:title]).to eq(utm_link.title)
+      expect(inertia.props[:utm_link][:permalink]).to eq(utm_link.permalink)
     end
   end
 

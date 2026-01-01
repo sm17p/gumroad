@@ -9,24 +9,17 @@ class UtmLinkPresenter
   end
 
   def new_page_react_props(copy_from: nil)
-    reference_utm_link = seller.utm_links.alive.find_by_external_id(copy_from) if copy_from.present?
-    context_props = utm_link_form_context_props
+    @utm_link = (copy_from.present? && seller.utm_links.alive.find_by_external_id(copy_from)) || UtmLink.new
 
-    if reference_utm_link.present?
-      utm_link_props = self.class.new(seller:, utm_link: reference_utm_link).utm_link_props.except(:id)
-      utm_link_props[:title] = "#{utm_link_props[:title]} (copy)"
-      utm_link_props[:short_url] = context_props[:short_url]
-    end
+    new_utm_link_form_props = utm_link_form_props.except(:id, :permalink)
+    new_utm_link_form_props[:title] = "#{new_utm_link_form_props[:title]} (copy)" if copy_from.present?
+    new_utm_link_form_props[:permalink] = UtmLink.generate_permalink
 
-    { context: context_props, utm_link: utm_link_props }
+    { context: utm_link_form_context_props, utm_link: new_utm_link_form_props }
   end
 
   def edit_page_react_props
-    { context: utm_link_form_context_props, utm_link: utm_link_props }
-  end
-
-  def new_additional_metadata_props
-    { new_permalink: UtmLink.generate_permalink }
+    { context: utm_link_form_context_props, utm_link: utm_link_form_props }
   end
 
   def utm_link_props
@@ -51,6 +44,16 @@ class UtmLinkPresenter
 
   private
     attr_reader :seller, :utm_link
+
+    def utm_link_form_props
+      utm_link.slice(:target_resource_type, :permalink, :utm_source, :utm_medium, :utm_campaign, :utm_term, :utm_content)
+        .merge(
+          title: utm_link.title || "",
+          id: utm_link.external_id,
+          target_resource_id: utm_link.target_resource&.external_id,
+          destination_option: utm_link.target_resource_type && destination_option(type: utm_link.target_resource_type, resource: utm_link.target_resource, add_label_prefix: true)
+        )
+    end
 
     def utm_link_form_context_props
       products = *seller.products.includes(:user).alive.order(:name).map { destination_option(type: UtmLink.target_resource_types[:product_page], resource: _1) }
@@ -77,7 +80,8 @@ class UtmLinkPresenter
           *products,
           *posts,
         ],
-        short_url: utm_link.present? ? utm_link.short_url : UtmLink.new(permalink: UtmLink.generate_permalink).short_url,
+        short_url_prefix: UtmLink.short_url_prefix,
+        short_url_protocol: PROTOCOL,
         utm_fields_values:,
       }
     end

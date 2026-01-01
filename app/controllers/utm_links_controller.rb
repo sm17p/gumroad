@@ -28,12 +28,7 @@ class UtmLinksController < Sellers::BaseController
   end
 
   def new
-    utm_link_presenter = UtmLinkPresenter.new(seller: current_seller)
-
-    render inertia: "UtmLinks/New", props: {
-      **utm_link_presenter.new_page_react_props(copy_from: params[:copy_from]),
-      additional_metadata: InertiaRails.optional { utm_link_presenter.new_additional_metadata_props },
-    }
+    render inertia: "UtmLinks/New", props: UtmLinkPresenter.new(seller: current_seller).new_page_react_props(copy_from: params[:copy_from])
   end
 
   def edit
